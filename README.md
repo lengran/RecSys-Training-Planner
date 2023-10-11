@@ -2,7 +2,7 @@
 
 ## Usage
 
-Clone https://github.com/STAR-Laboratory/Accelerating-RecSys-Training and put files accordingly.
+Clone https://github.com/STAR-Laboratory/Accelerating-RecSys-Training and place files accordingly.
 
 Code base:
 

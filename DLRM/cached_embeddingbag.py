@@ -77,13 +77,30 @@ class CacheManager(torch.nn.Module):
 
     def __init__(
         self,
+        weight: torch.Tensor = None,
+        cuda_row_num: int = 0,
+        buffer_size: int = 0,
+        pin_weight: bool = False,
+        async_copy: bool = False
+    ) -> None:
+        '''
+        A fake init method to enable "create an object before actually use it".
+        Create the cache object before dataloaders exist so it can callback to update cache rows.
+        The actual init of the cache is after embedding layer created)
+        '''
+        super().__init__()
+
+        if weight is not None:
+            self.init(weight=weight, cuda_row_num=cuda_row_num, buffer_size=buffer_size, pin_weight=pin_weight, async_copy=async_copy)
+
+    def init(
+        self,
         weight: torch.Tensor,
         cuda_row_num: int = 0,
         buffer_size: int = 0,
         pin_weight: bool = False,
         async_copy: bool = False
     ) -> None:
-        super().__init__()
         self.buffer_size = buffer_size
         self.num_embeddings, self.embedding_dim = weight.shape
         self.cuda_row_num = cuda_row_num
@@ -365,6 +382,17 @@ class CacheManager(torch.nn.Module):
         ret = self.inverted_cached_idx.index_select(0, ids)
         return ret
 
+    @torch.no_grad()
+    def update_batch_flag(self, batch_pointer: int = None) -> None:
+        if batch_pointer is not None:
+            self._finished_batch = batch_pointer
+        else:
+            self._finished_batch = self._finished_batch + 1
+
+    @property
+    def cuda_available_row_num(self):
+        return self._cuda_available_row_num
+
 class CachedEmbeddingBag(torch.nn.Module):
     """GPU cached EmbeddingBag."""
 
@@ -441,6 +469,49 @@ class CachedEmbeddingBag(torch.nn.Module):
         )
         if shape_hook is not None:
             embeddings = shape_hook(embeddings)
+        
+        # Shall we update batch flag here?
+        self.cache_weight_mgr.update_batch_flag()
+
         return embeddings
     
+    @property
+    def weight(self):
+        return self.cache_weight_mgr.weight
     
+    ############################# Perf Log ###################################
+
+    @property
+    def num_hits_history(self):
+        return self.cache_weight_mgr.num_hits_history
+
+    @property
+    def num_miss_history(self):
+        return self.cache_weight_mgr.num_miss_history
+
+    @property
+    def num_write_back_history(self):
+        return self.cache_weight_mgr.num_write_back_history
+
+    @property
+    def swap_in_bandwidth(self):
+        if self.cache_weight_mgr._cpu_to_cuda_numel > 0:
+            return (
+                self.cache_weight_mgr._cpu_to_cuda_numel
+                * self.cache_weight_mgr.elem_size_in_byte
+                / 1e6
+                / self.cache_weight_mgr._cpu_to_cuda_elapse
+            )
+        else:
+            return 0
+
+    @property
+    def swap_out_bandwidth(self):
+        if self.cache_weight_mgr._cuda_to_cpu_numel > 0:
+            return (
+                self.cache_weight_mgr._cuda_to_cpu_numel
+                * self.cache_weight_mgr.elem_size_in_byte
+                / 1e6
+                / self.cache_weight_mgr._cuda_to_cpu_elapse
+            )
+        return 0
