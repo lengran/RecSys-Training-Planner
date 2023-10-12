@@ -14,3 +14,8 @@ Date:   Sun Sep 17 17:10:02 2023 -0700
     Updated
 ```
 
+## Note
+
+Both qr\_flag and md\_flag for the embedding layer are not supported.
+
+num\_workers in dataloader is not supported.

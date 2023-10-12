@@ -266,15 +266,15 @@ class DLRM_Net(nn.Module):
 			if self.md_flag:
 				self.md_threshold = md_threshold
 			
+			# Pointer to cache managers created by the data manager
+			self.cache_list = cache_list
+			
 			self.emb_l = self.create_emb(m_spa, ln_emb)
 			print("EMB : ", ln_emb)
 			self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
 			self.bot_l = self.bot_l.to("cuda:0")
 			self.top_l = self.create_mlp(ln_top, sigmoid_top)
 			self.top_l = self.top_l.to("cuda:0")
-		
-		# Pointer to cache managers created by the data manager
-		self.cache_list = cache_list
 
 	def apply_mlp(self, x, layers):
 		# approach 1: use ModuleList
