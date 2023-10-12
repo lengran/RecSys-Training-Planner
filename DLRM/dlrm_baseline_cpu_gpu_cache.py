@@ -62,6 +62,7 @@ import time
 import json
 # data generation
 import dlrm_data_pytorch as dp
+import dlrm_data_pytorch_cache as dpc
 from cached_embeddingbag import CachedEmbeddingBag
 
 # numpy
@@ -195,7 +196,7 @@ class DLRM_Net(nn.Module):
 			else:
 				# EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
 				# Magic happens here! (using cached embeddingbag instead of the factory one)
-				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.05)
+				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.05, cache_mgr=self.cache_list[i])
 				EE.set_cache_mgr_async_copy(True)
 
 				# initialize embeddings
@@ -233,6 +234,7 @@ class DLRM_Net(nn.Module):
 		qr_threshold=200,
 		md_flag=False,
 		md_threshold=200,
+		cache_list: list = None
 	):
 		super(DLRM_Net, self).__init__()
 
@@ -270,6 +272,9 @@ class DLRM_Net(nn.Module):
 			self.bot_l = self.bot_l.to("cuda:0")
 			self.top_l = self.create_mlp(ln_top, sigmoid_top)
 			self.top_l = self.top_l.to("cuda:0")
+		
+		# Pointer to cache managers created by the data manager
+		self.cache_list = cache_list
 
 	def apply_mlp(self, x, layers):
 		# approach 1: use ModuleList
@@ -570,8 +575,14 @@ if __name__ == "__main__":
 	# input data
 	if (args.data_generation == "dataset"):
 
-		train_data, train_ld, test_data, test_ld = \
-			dp.make_criteo_data_and_loaders(args)
+		# train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
+		# A data object contains datasets, dataloader and cache managers.
+		data_mgr = dpc.DataManager(args=args)
+		train_data = data_mgr.train_data
+		train_ld = data_mgr.train_loader
+		test_data = data_mgr.test_data
+		test_ld = data_mgr.test_loader
+
 		nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
 		nbatches_test = len(test_ld)
 

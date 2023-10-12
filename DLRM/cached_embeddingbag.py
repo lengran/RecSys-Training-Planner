@@ -412,7 +412,8 @@ class CachedEmbeddingBag(torch.nn.Module):
             dtype: torch.dtype = None,
             cached_ratio: float = 0.01,
             buffer_size: int = 50_000,
-            pin_weight: bool = False
+            pin_weight: bool = False,
+            cache_mgr: CacheManager = None
     ) -> None:
         # Factory Pytorch init code (_weight init code removed)
         super().__init__()
@@ -443,7 +444,10 @@ class CachedEmbeddingBag(torch.nn.Module):
                     _weight[self.padding_idx].fill_(0)
         else:
             assert list(_weight.shape) == [num_embeddings, embedding_dim], 'Shape of weight does not match num_embeddings and embedding_dim'
-        self.cache_weight_mgr = CacheManager(_weight, cuda_row_num, buffer_size, pin_weight)
+        if cache_mgr is None:
+            self.cache_weight_mgr = CacheManager(_weight, cuda_row_num, buffer_size, pin_weight)
+        else:
+            self.cache_weight_mgr = cache_mgr.init(_weight, cuda_row_num, buffer_size, pin_weight)
         self.cache_op = True
 
     def set_cache_mgr_async_copy(self, flag):
