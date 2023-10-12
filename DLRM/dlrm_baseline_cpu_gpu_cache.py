@@ -750,6 +750,7 @@ if __name__ == "__main__":
 		qr_threshold=args.qr_threshold,
 		md_flag=args.md_flag,
 		md_threshold=args.md_threshold,
+		cache_list=data_mgr.cache_list
 	)
 	# test prints
 	if args.debug_mode:
