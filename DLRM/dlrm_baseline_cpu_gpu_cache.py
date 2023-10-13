@@ -196,8 +196,7 @@ class DLRM_Net(nn.Module):
 			else:
 				# EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
 				# Magic happens here! (using cached embeddingbag instead of the factory one)
-				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.05, cache_mgr=self.cache_list[i])
-				EE.set_cache_mgr_async_copy(True)
+				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.25, cache_mgr=self.cache_list[i])
 
 				# initialize embeddings
 				# nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
@@ -563,7 +562,7 @@ if __name__ == "__main__":
 		torch.cuda.manual_seed_all(args.numpy_rand_seed)
 		torch.backends.cudnn.deterministic = True
 		device = torch.device("cuda", 0)
-		ngpus = torch.cuda.device_count()  # 1
+		ngpus = 1 # torch.cuda.device_count()  # 1
 		print("Running DLRM Baseline")
 		print("Using CPU and {} GPU(s)...".format(ngpus))
 	else:
@@ -888,7 +887,7 @@ if __name__ == "__main__":
 		)
 
 	print("time/loss/accuracy (if enabled):")
-	with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
+	with torch.autograd.profiler.profile(enabled=args.enable_profiling, use_cuda=use_gpu) as prof:
 		while k < args.nepochs:
 			if k < skip_upto_epoch:
 				continue

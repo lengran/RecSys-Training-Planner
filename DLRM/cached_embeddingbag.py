@@ -1,6 +1,8 @@
 import torch
 import sys
 from typing import Optional
+from contexttimer import Timer
+from contextlib import contextmanager
 
 class LimitBuffIndexCopyer(object):
     """LimitBuffIndexCopyer
@@ -203,6 +205,7 @@ class CacheManager(torch.nn.Module):
             # identify cpu rows to cache
             with self.timer("1_identify_cpu_row_idxs") as timer:
                 with torch.profiler.record_function("(cache) get unique indices"):
+                    ids = ids.to(torch.cuda.current_device())
                     cpu_row_idxs, repeat_times = torch.unique(self.idx_map.index_select(0, ids), return_counts=True)
 
                     assert len(cpu_row_idxs) <= self.cuda_row_num, (
@@ -393,6 +396,16 @@ class CacheManager(torch.nn.Module):
     def cuda_available_row_num(self):
         return self._cuda_available_row_num
 
+    @contextmanager
+    def timer(self, name):
+        with Timer() as t:
+            yield
+            torch.cuda.synchronize()
+
+        if name not in self._elapsed_dict.keys():
+            self._elapsed_dict[name] = 0
+        self._elapsed_dict[name] += t.elapsed
+    
 class CachedEmbeddingBag(torch.nn.Module):
     """GPU cached EmbeddingBag."""
 
@@ -436,6 +449,8 @@ class CachedEmbeddingBag(torch.nn.Module):
         # Initialize weight and GPU cache related things.
         assert cached_ratio <= 1.0, f'cache ratio {cached_ratio} should be smaller than 1.0' 
         cuda_row_num = int(num_embeddings * cached_ratio)
+        if cuda_row_num <= 0:
+            cuda_row_num = num_embeddings
         if _weight is None:
             _weight = torch.empty(self.num_embeddings, self.embedding_dim, dtype=dtype, device=device)
             torch.nn.init.normal_(_weight)
@@ -447,16 +462,18 @@ class CachedEmbeddingBag(torch.nn.Module):
         if cache_mgr is None:
             self.cache_weight_mgr = CacheManager(_weight, cuda_row_num, buffer_size, pin_weight)
         else:
-            self.cache_weight_mgr = cache_mgr.init(_weight, cuda_row_num, buffer_size, pin_weight)
+            self.cache_weight_mgr = cache_mgr
+            self.cache_weight_mgr.init(_weight, cuda_row_num, buffer_size, pin_weight)
+        
         self.cache_op = True
 
-    def set_cache_mgr_async_copy(self, flag):
+    def set_cache_mgr_async_copy(self, flag: bool):
         self.cache_weight_mgr._async_copy = flag
     
     def forward(self, input, offsets=None, per_sample_weights=None, shape_hook=None):
-        if self.cache_op:
-            with torch.no_grad():
-                input = self.cache_weight_mgr.prepare_ids(input)
+        # if self.cache_op:
+        #     with torch.no_grad():
+        #         input = self.cache_weight_mgr.prepare_ids(input)
         
         embeddings = torch.nn.functional.embedding_bag(
             input.cuda(),
