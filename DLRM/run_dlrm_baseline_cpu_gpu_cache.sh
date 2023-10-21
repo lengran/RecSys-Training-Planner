@@ -9,4 +9,5 @@ python dlrm_baseline_cpu_gpu_cache.py --arch-sparse-feature-size=16 \
 								--round-targets=True \
 								--mini-batch-size=1024 \
 								--print-freq=4096 \
-								--print-time
+								--print-time \
+								--cache-ratio=0.15

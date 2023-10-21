@@ -62,8 +62,6 @@ import time
 import json
 # data generation
 import dlrm_data_pytorch as dp
-import dlrm_data_pytorch_cache as dpc
-from cached_embeddingbag import CachedEmbeddingBag
 
 # numpy
 import numpy as np
@@ -87,6 +85,10 @@ from tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
+# Cached Embedding classes
+from cached_embeddingbag import CachedEmbeddingBag
+from dlrm_data_pytorch_cache import Data_Manager
+
 import sklearn.metrics
 
 # from torchviz import make_dot
@@ -94,6 +96,10 @@ import sklearn.metrics
 # from torch.nn.parameter import Parameter
 
 from torch.optim.lr_scheduler import _LRScheduler
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
+# os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -177,6 +183,7 @@ class DLRM_Net(nn.Module):
 
 	def create_emb(self, m, ln):
 		emb_l = nn.ModuleList()
+		cat_offset = 0
 		for i in range(0, ln.size):
 			n = ln[i]
 			# construct embedding operator
@@ -196,7 +203,8 @@ class DLRM_Net(nn.Module):
 			else:
 				# EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
 				# Magic happens here! (using cached embeddingbag instead of the factory one)
-				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.25, cache_mgr=self.cache_list[i])
+				# EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.25, cache_mgr=self.cache_list[i])
+				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cache_mgr=self.gpu_cache, cat_offset=cat_offset)
 
 				# initialize embeddings
 				# nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
@@ -204,14 +212,15 @@ class DLRM_Net(nn.Module):
 					low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
 				).astype(np.float32)
 				# approach 1
-				EE.weight.data = torch.tensor(W, requires_grad=True)
+				# EE.weight.data = torch.tensor(W, requires_grad=True)
 				# approach 2
 				# EE.weight.data.copy_(torch.tensor(W))
 				# approach 3
 				# EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+				EE.weight.data[cat_offset:cat_offset + n, :] = torch.tensor(W)
 
 			emb_l.append(EE)
-
+			cat_offset = cat_offset + n
 		return emb_l
 
 	def __init__(
@@ -233,7 +242,7 @@ class DLRM_Net(nn.Module):
 		qr_threshold=200,
 		md_flag=False,
 		md_threshold=200,
-		cache_list: list = None
+		gpu_cache=None
 	):
 		super(DLRM_Net, self).__init__()
 
@@ -266,7 +275,7 @@ class DLRM_Net(nn.Module):
 				self.md_threshold = md_threshold
 			
 			# Pointer to cache managers created by the data manager
-			self.cache_list = cache_list
+			self.gpu_cache = gpu_cache
 			
 			self.emb_l = self.create_emb(m_spa, ln_emb)
 			print("EMB : ", ln_emb)
@@ -539,6 +548,7 @@ if __name__ == "__main__":
 	parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
 	parser.add_argument("--lr-decay-start-step", type=int, default=0)
 	parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+	parser.add_argument("--cache-ratio", type=float, default=0.15)
 	args = parser.parse_args()
 
 	if args.mlperf_logging:
@@ -562,7 +572,7 @@ if __name__ == "__main__":
 		torch.cuda.manual_seed_all(args.numpy_rand_seed)
 		torch.backends.cudnn.deterministic = True
 		device = torch.device("cuda", 0)
-		ngpus = 1 # torch.cuda.device_count()  # 1
+		ngpus = torch.cuda.device_count()  # 1
 		print("Running DLRM Baseline")
 		print("Using CPU and {} GPU(s)...".format(ngpus))
 	else:
@@ -576,7 +586,7 @@ if __name__ == "__main__":
 
 		# train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
 		# A data object contains datasets, dataloader and cache managers.
-		data_mgr = dpc.DataManager(args=args)
+		data_mgr = Data_Manager(args=args)
 		train_data = data_mgr.train_data
 		train_ld = data_mgr.train_loader
 		test_data = data_mgr.test_data
@@ -749,7 +759,7 @@ if __name__ == "__main__":
 		qr_threshold=args.qr_threshold,
 		md_flag=args.md_flag,
 		md_threshold=args.md_threshold,
-		cache_list=data_mgr.cache_list
+		gpu_cache=data_mgr.gpu_cache
 	)
 	# test prints
 	if args.debug_mode:
@@ -785,8 +795,8 @@ if __name__ == "__main__":
 		if use_gpu:  # .cuda()
 			return dlrm(
 				X.to(device),
-				lS_o,
-				lS_i
+				lS_o.to(device),
+				lS_i.to(device)
 			)
 		else:
 			return dlrm(X, lS_o, lS_i)

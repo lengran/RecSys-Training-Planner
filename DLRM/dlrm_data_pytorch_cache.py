@@ -3,7 +3,7 @@ from dlrm_data_pytorch import CriteoDataset
 from cached_embeddingbag import CacheManager
 import torch
 
-class DataManager(object):
+class Data_Manager(object):
     '''
     Contains datasets, cache managers and dataloaders.
     '''
@@ -90,14 +90,16 @@ class DataManager(object):
 
             # Create empty cache now so the dataloader can callback them later.
             self.batch_pointer = 0
-            ln = self.train_data.counts
-            args.arch_sparse_feature_size
-            self.cache_list = list()
+            num_embedding_list = self.train_data.counts
+            total_embedding_row = 0
+            self.offsets = list()
+            for i in range(num_embedding_list.size):
+                self.offsets.append(total_embedding_row)
+                total_embedding_row = total_embedding_row + num_embedding_list[i]
 
-            for _ in range(ln.size):
-                gpucache = CacheManager()
-                self.cache_list.append(gpucache)
-            
+            embedding_dim = args.arch_sparse_feature_size
+            self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)
+
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
                 self.train_data,
@@ -135,8 +137,8 @@ class DataManager(object):
 
         # Update cache and the batch pointer
         for i in range(featureCnt):
-            ids = X_cat[:, i].flatten()
-            self.cache_list[i].prepare_ids(ids, self.batch_pointer)
+            offseted_ids = X_cat[:, i].flatten().add(self.offsets[i])           # A naive way to hash ids in diff cats, TODO: design a better hash function
+            self.gpu_cache.prepare_ids(offseted_ids, self.batch_pointer)
         self.batch_pointer = self.batch_pointer + 1
 
         lS_i = [X_cat[:, i] for i in range(featureCnt)]

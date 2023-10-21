@@ -79,36 +79,32 @@ class CacheManager(torch.nn.Module):
 
     def __init__(
         self,
-        weight: torch.Tensor = None,
+        num_embeddings: int = None,
+        embedding_dim: int = None,
+        weight: Optional[torch.Tensor] = None,
+        cache_ratio: float = None,
         cuda_row_num: int = 0,
-        buffer_size: int = 0,
+        buffer_size: int = 50_000,
         pin_weight: bool = False,
-        async_copy: bool = False
+        async_copy: bool = False, 
     ) -> None:
-        '''
-        A fake init method to enable "create an object before actually use it".
-        Create the cache object before dataloaders exist so it can callback to update cache rows.
-        The actual init of the cache is after embedding layer created)
-        '''
         super().__init__()
 
-        if weight is not None:
-            self.init(weight=weight, cuda_row_num=cuda_row_num, buffer_size=buffer_size, pin_weight=pin_weight, async_copy=async_copy)
-
-    def init(
-        self,
-        weight: torch.Tensor,
-        cuda_row_num: int = 0,
-        buffer_size: int = 0,
-        pin_weight: bool = False,
-        async_copy: bool = False
-    ) -> None:
+        if weight is None:
+            weight = torch.empty(num_embeddings, embedding_dim, device=torch.device('cpu'), requires_grad=False)
+            # torch.nn.init.normal_(weight)
         self.buffer_size = buffer_size
         self.num_embeddings, self.embedding_dim = weight.shape
-        self.cuda_row_num = cuda_row_num
+        self.elem_size_in_byte = weight.element_size()
+        if cache_ratio is not None:
+            self.cuda_row_num = int(self.num_embeddings * cache_ratio)
+            if self.cuda_row_num <= 0:
+                self.cuda_row_num = int(2 * (1024 * 1024 * 1024) / (self.elem_size_in_byte * self.embedding_dim))  # 2GB cache
+        else:
+            self.cuda_row_num = cuda_row_num
         self._cuda_available_row_num = self.cuda_row_num
         self.pin_weight = pin_weight
-        self.elem_size_in_byte = weight.element_size()
+        
 
         self._init_weight(weight)
 
@@ -129,17 +125,18 @@ class CacheManager(torch.nn.Module):
         # Register for batch flags (gpu_row_idx -> batch_flag)
         self.register_buffer(
             "batch_flags",
-            torch.empty(self.cuda_row_num, device=torch.cuda.current_device(), dtype=torch.long).fill_(-1),
+            torch.empty(self.cuda_row_num, device=torch.cuda.current_device(), dtype=torch.long, requires_grad=False).fill_(-1),
             persistent=False,
         )
         self._finished_batch = -1
+        self._num_binded_embedding_bag = 0
     
-    def _init_weight(self, weight) -> None:
+    def _init_weight(self, weight: torch.Tensor) -> None:
         if self.cuda_row_num > 0:
             # Enable cache with introducing auxiliary data structures
             self.cuda_cached_weight = torch.nn.Parameter(
                 torch.zeros(
-                    self.cuda_row_num, self.embedding_dim, device=torch.cuda.current_device(), dtype=weight.dtype
+                    self.cuda_row_num, self.embedding_dim, device=torch.cuda.current_device(), dtype=weight.dtype, requires_grad=True
                 )
             )
 
@@ -191,12 +188,13 @@ class CacheManager(torch.nn.Module):
             self._cache_miss = 0
             self._total_cache = 0
 
-    def prepare_ids(self, ids: torch.Tensor, batch_pointer: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def prepare_ids(self, ids: torch.Tensor, batch_pointer: int) -> torch.Tensor:
         """
         move the cpu embedding rows w.r.t. ids into CUDA memory
         Args:
             ids (torch.Tensor): the ids to be computed
-            batch_pointer (torch.LongTensor): the pointer to (or index of) the current loading batch
+            batch_pointer (int): the pointer to (or index of) the current loading batch
         Returns:
             torch.Tensor: indices on the cuda_cached_weight.
         """
@@ -228,13 +226,13 @@ class CacheManager(torch.nn.Module):
             # move sure the cuda rows will not be evicted!
             with torch.profiler.record_function("(cache) prepare_rows_on_cuda"):
                 with self.timer("prepare_rows_on_cuda") as timer:
-                    self._prepare_rows_on_cuda(comm_cpu_row_idxs)
+                    self._prepare_rows_on_cuda(comm_cpu_row_idxs, batch_pointer)
 
             self.evict_backlist = torch.tensor([], device=cpu_row_idxs.device, dtype=cpu_row_idxs.dtype)
 
             with self.timer("6_update_cache") as timer:
                 with torch.profiler.record_function("6_update_cache"):
-                    gpu_row_idxs = self._id_to_cached_cuda_id(ids)
+                    gpu_row_idxs = self.id_to_cached_cuda_idx(ids)
                 
                 # Update batch flag
                 unique_gpu_row_idxs = self.inverted_cached_idx[cpu_row_idxs]
@@ -243,7 +241,7 @@ class CacheManager(torch.nn.Module):
         return gpu_row_idxs
 
     @torch.no_grad()
-    def _prepare_rows_on_cuda(self, cpu_row_idxs: torch.Tensor) -> None:
+    def _prepare_rows_on_cuda(self, cpu_row_idxs: torch.Tensor, batch_pointer: int) -> None:
         """prepare rows in cpu_row_idxs on CUDA memory
         Args:
             cpu_row_idxs (torch.Tensor): the rows to be placed on CUDA
@@ -268,8 +266,11 @@ class CacheManager(torch.nn.Module):
                 mask_cpu_row_idx = torch.isin(self.cached_idx_map, self.evict_backlist)
                 invalid_idxs = torch.nonzero(mask_cpu_row_idx).squeeze(1)
                 
+                with self.timer("2_1_update_batch_flags_of_existing_gpu_row") as timer:
+                    self.batch_flags.index_fill_(0, invalid_idxs, batch_pointer)
+                
                 # Batch flag based evict strategy
-                with self.timer("2_find_evict_gpu_idxs") as timer:
+                with self.timer("2_2_find_evict_gpu_idxs") as timer:
                     evict_gpu_row_idxs = self._find_evict_gpu_idxs(evict_num)
 
                 if self._async_copy:
@@ -359,7 +360,7 @@ class CacheManager(torch.nn.Module):
         self._cpu_to_cuda_numel += weight_size
         # print(f"admit embedding weight: {weight_size*self.elem_size_in_byte/1e6:.2f} MB")
 
-    
+    @torch.no_grad()
     def _find_evict_gpu_idxs(self, evict_num: int) -> torch.Tensor:
         """_find_evict_gpu_idxs
         Find the gpu idxs to be evicted, according to their batch flags and current self._finished_batch flag.
@@ -372,7 +373,7 @@ class CacheManager(torch.nn.Module):
         return victim_gpu_rows
 
     @torch.no_grad()
-    def _id_to_cached_cuda_id(self, ids: torch.Tensor) -> torch.Tensor:
+    def id_to_cached_cuda_idx(self, ids: torch.Tensor) -> torch.Tensor:
         """
         convert ids to indices in self.cuda_cached_weight.
         Implemented with parallel operations on GPU.
@@ -381,16 +382,28 @@ class CacheManager(torch.nn.Module):
         Returns:
             torch.Tensor: contains indices in self.cuda_cached_weight
         """
-        ids = self.idx_map.index_select(0, ids.view(-1))
-        ret = self.inverted_cached_idx.index_select(0, ids)
-        return ret
+        cpu_idx = self.idx_map.index_select(0, ids.view(-1))
+        gpu_idx = self.inverted_cached_idx.index_select(0, cpu_idx)
+        return gpu_idx
 
+    def register_embedding_bag(self) -> int:
+        self._num_binded_embedding_bag = self._num_binded_embedding_bag + 1
+        self._embedding_bag_update_flags = 0
+        return self._num_binded_embedding_bag
+    
     @torch.no_grad()
-    def update_batch_flag(self, batch_pointer: int = None) -> None:
+    def update_batch_flag(self, batch_pointer: int = None, embedding_bag_id: int = None) -> None:
+        # TODO: Improve efficiency under parallel excution, remove shared read-and-write data hotspot.
+        # Hard set batch_pointer
         if batch_pointer is not None:
             self._finished_batch = batch_pointer
+        # Update batch_pointer automaticlly
         else:
-            self._finished_batch = self._finished_batch + 1
+            self._embedding_bag_update_flags = self._embedding_bag_update_flags + 1
+            # Only update batch_pointer when all embedding layers have finished computing this batch
+            if self._embedding_bag_update_flags >= self._num_binded_embedding_bag:
+                self._embedding_bag_update_flags = 0
+                self._finished_batch = self._finished_batch + 1
 
     @property
     def cuda_available_row_num(self):
@@ -407,7 +420,11 @@ class CacheManager(torch.nn.Module):
         self._elapsed_dict[name] += t.elapsed
     
 class CachedEmbeddingBag(torch.nn.Module):
-    """GPU cached EmbeddingBag."""
+    """
+    GPU cached EmbeddingBag.
+    args:
+        cat_offset: Since all embedding bags share a common cache, ids_in_cache should be ids_in_cat + cat_offset
+    """
 
     def __init__(
             self,
@@ -426,7 +443,8 @@ class CachedEmbeddingBag(torch.nn.Module):
             cached_ratio: float = 0.01,
             buffer_size: int = 50_000,
             pin_weight: bool = False,
-            cache_mgr: CacheManager = None
+            cache_mgr: CacheManager = None,
+            cat_offset: int = 0,
     ) -> None:
         # Factory Pytorch init code (_weight init code removed)
         super().__init__()
@@ -447,36 +465,49 @@ class CachedEmbeddingBag(torch.nn.Module):
         self.include_last_offset = include_last_offset
 
         # Initialize weight and GPU cache related things.
-        assert cached_ratio <= 1.0, f'cache ratio {cached_ratio} should be smaller than 1.0' 
-        cuda_row_num = int(num_embeddings * cached_ratio)
-        if cuda_row_num <= 0:
-            cuda_row_num = num_embeddings
-        if _weight is None:
-            _weight = torch.empty(self.num_embeddings, self.embedding_dim, dtype=dtype, device=device)
-            torch.nn.init.normal_(_weight)
-            if self.padding_idx is not None:
-                with torch.no_grad():
-                    _weight[self.padding_idx].fill_(0)
-        else:
-            assert list(_weight.shape) == [num_embeddings, embedding_dim], 'Shape of weight does not match num_embeddings and embedding_dim'
         if cache_mgr is None:
+            assert cached_ratio <= 1.0, f'cache ratio {cached_ratio} should be smaller than 1.0' 
+            cuda_row_num = int(num_embeddings * cached_ratio)
+            if cuda_row_num <= 0:
+                cuda_row_num = num_embeddings
+        
+            self.cat_offset = None
+
+            if _weight is None:
+                _weight = torch.empty(self.num_embeddings, self.embedding_dim, dtype=dtype, device=device)
+                torch.nn.init.normal_(_weight)
+                if self.padding_idx is not None:
+                    with torch.no_grad():
+                        _weight[self.padding_idx].fill_(0)
+            else:
+                assert list(_weight.shape) == [num_embeddings, embedding_dim], 'Shape of weight does not match num_embeddings and embedding_dim'
+            
             self.cache_weight_mgr = CacheManager(_weight, cuda_row_num, buffer_size, pin_weight)
         else:
             self.cache_weight_mgr = cache_mgr
-            self.cache_weight_mgr.init(_weight, cuda_row_num, buffer_size, pin_weight)
+            self.embedding_bag_id = self.cache_weight_mgr.register_embedding_bag()
+            self.cat_offset = cat_offset
+            torch.nn.init.normal_(self.cache_weight_mgr.weight.data[cat_offset : cat_offset + self.num_embeddings, :])
         
         self.cache_op = True
 
     def set_cache_mgr_async_copy(self, flag: bool):
         self.cache_weight_mgr._async_copy = flag
     
-    def forward(self, input, offsets=None, per_sample_weights=None, shape_hook=None):
-        # if self.cache_op:
-        #     with torch.no_grad():
-        #         input = self.cache_weight_mgr.prepare_ids(input)
+    def forward(self, input: torch.Tensor, offsets=None, per_sample_weights=None, shape_hook=None):
+        with torch.no_grad():
+            # input = input.cuda()
+            # offsets = offsets.cuda()
+            if self.cache_op:
+                # input = self.cache_weight_mgr.prepare_ids(input)
+                if self.cat_offset is not None:
+                    input =  input.add(self.cat_offset)
+                # idx_in_cache = self.cache_weight_mgr.idx_map.index_select(0, input)
+                # idx_in_cuda_cache = self.cache_weight_mgr.inverted_cached_idx.index_select(0, idx_in_cache)
+                idx_in_cuda_cache = self.cache_weight_mgr.id_to_cached_cuda_idx(input)
         
         embeddings = torch.nn.functional.embedding_bag(
-            input.cuda(),
+            idx_in_cuda_cache,
             self.cache_weight_mgr.cuda_cached_weight,
             offsets,
             self.max_norm,
@@ -488,11 +519,13 @@ class CachedEmbeddingBag(torch.nn.Module):
             self.include_last_offset,
             self.padding_idx,
         )
+        
         if shape_hook is not None:
             embeddings = shape_hook(embeddings)
         
         # Shall we update batch flag here?
-        self.cache_weight_mgr.update_batch_flag()
+        with torch.no_grad():
+            self.cache_weight_mgr.update_batch_flag(embedding_bag_id=self.embedding_bag_id)
 
         return embeddings
     
