@@ -1,0 +1,277 @@
+import cudf as df
+import numpy as np
+from typing import Optional
+import os
+import gc
+from collections import deque
+import random
+from math import ceil
+import statistics
+import time
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+LARGE_NUMBER = 10000000
+
+GPU_CACHE_SIZE = int(33762577 * 0.05)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
+DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
+PLAN_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/training_plan/"
+
+class Planner(object):
+    def __init__(
+            self, 
+            plan_path: str, 
+            data_path: str, 
+            log_path: str, 
+            cached_rows: int, 
+            warm_up_steps: int = 20, 
+            search_ratio: float = 0.3, 
+            search_limit: int = None,
+            hotness_diff_threshold_update_period: int = 10,
+            hotness_diff_threshold_base_relax_ratio: float = 0.95,
+            hotness_diff_threshold_increment_relax_ratio: float = 0.001,
+            hotness_diff_threshold_relax_ratio_penalty_rate: float = 0.5,
+            hotness_diff_threshold_init_value: int = 0,
+            hotness_diff_threshold_late_time_cap: float = 1,
+            hotness_diff_threshold_startup_cap: int = 0,
+            hotness_diff_threshold_recal_steps: int = 0,
+            ) -> None:
+        '''
+        args:
+            plan_path (str): Directory to read batches from and write generated plan to.
+            data_path (str): Path to the dataset file (a numpy xyz file).
+            log_path (str): A directory to store planning logs.
+            cached_rows (int): Size of the simulated GPU cache (number of rows).
+            warm_up_steps (int): Steps in the warm up phase. (for the heuristic searching algorithm)
+            search_ratio (float): If search_limit is None, this decides how many possible choices we search. (for the heuristic searching algorithm)
+            search_limit (int): Possible choices we search in each searching step. This serves as an efficiency guarantee. (for the heuristic searching algorithm)
+            hotness_diff_threshold_update_period (int): Every number of steps after which we update the hotness difference threshold. (for the heuristic searching algorithm)
+            hotness_diff_threshold_base_relax_ratio (float): How much variation do we allow about the threshold. (for the heuristic searching algorithm)
+            hotness_diff_threshold_increment_relax_ratio (float): Aggregated increment added to the base relax_ratio while threshold hit. (for the heuristic searching algorithm)
+            hotness_diff_threshold_relax_ratio_penalty_rate (float): Decrease the aggregated increment by this ratio. (for the heuristic searching algorithm)
+            hotness_diff_threshold_init_value (int): Initilized value for hotness_diff_threshold. (for the heuristic searching algorithm)
+            hotness_diff_threshold_startup_cap (int): The hotness_diff threshold should only be effective after searching such many choices. (for the heuristic searching algorithm)
+            hotness_diff_threshold_recal_steps (int): After searching such many steps, recalibrate the threshold.
+        '''
+        # Read cat_data
+        data = np.load(os.path.abspath(data_path))
+        X_cat = data["X_cat"]                                                                                               # categorical feature
+        cat_data = df.DataFrame(X_cat).astype(int)                                                                          # each column is a row of categorical features in the original dataset
+
+        # Read the batches.
+        batches = df.read_parquet(os.path.join(os.path.abspath(plan_path), "batches.parquet")).transpose()             # each column is a batch of indices of dataset's row
+        self.batch_num = batches.shape[1]
+        self.batch_size = batches.shape[0]
+        
+        self.cached_rows = cached_rows
+        self.cat_counts = list(data["counts"])
+
+        # Convert id from id_in_cat to unique_id_in_dataset
+        cat_offsets = list()
+        tmp_offset = 0
+        for i in range(len(self.cat_counts)):
+            cat_offsets.append(tmp_offset)
+            tmp_offset = tmp_offset + self.cat_counts[i]
+        cat_offsets = df.Series(cat_offsets)
+        cat_data = cat_data + cat_offsets
+
+        # Convert batches of indices to batches of ids
+        self.batches = list()
+        for i in range(0, self.batch_num - 1):
+            batch_indices = batches[i]
+            self.batches.append(cat_data.iloc[batch_indices].stack().unique())
+        # For batches[self.batch_num - 1], deal with -1s
+        batch_indices = df.Series([i for i in batches[self.batch_num - 1].values.tolist() if i != -1])
+        self.batches.append(cat_data.iloc[batch_indices].stack().unique())
+
+        # Misc
+        self.log_path = os.path.abspath(log_path)
+        self.warm_up_steps = min(warm_up_steps, self.batch_num)
+        if search_limit is None:
+            self.search_limit = self.batch_num * search_ratio
+        else:
+            self.search_limit = search_limit
+        self.hotness_diff_threshold_update_period = hotness_diff_threshold_update_period
+        if hotness_diff_threshold_init_value > 0:
+            self.hotness_diff_threshold_init_value = hotness_diff_threshold_init_value
+        else:
+            self.hotness_diff_threshold_init_value = LARGE_NUMBER
+        self.hotness_diff_threshold_base_relax_ratio = hotness_diff_threshold_base_relax_ratio
+        self.hotness_diff_threshold_increment_relax_ratio = hotness_diff_threshold_increment_relax_ratio
+        self.hotness_diff_threshold_relax_ratio_penalty_rate = hotness_diff_threshold_relax_ratio_penalty_rate
+        self.hotness_diff_threshold_late_time_cap = hotness_diff_threshold_late_time_cap
+        self.hotness_diff_threshold_startup_cap = hotness_diff_threshold_startup_cap
+        if hotness_diff_threshold_recal_steps > 0:
+            self.hotness_diff_threshold_recal_steps = hotness_diff_threshold_recal_steps
+        else:
+            self.hotness_diff_threshold_recal_steps = LARGE_NUMBER
+        
+    def Simulate_Cost(self, plan: list, init_cache_state: Optional[df.DataFrame], start_step: Optional[int], start_cost: Optional[int]):
+        '''
+        Calculate cost of a given route.
+        '''
+
+        num_steps = len(plan)
+        if isinstance(init_cache_state, df.DataFrame):
+            gpu_cache = init_cache_state
+            cost_total = start_cost
+            num_available_rows = self.cached_rows - gpu_cache.shape[0]
+        else:
+            gpu_cache = df.DataFrame(columns=['data', 'batch_flag'], dtype=int)
+            cost_total = 0
+            start_step = 0
+            num_available_rows = self.cached_rows
+        
+        # the main loop
+        for step in range(start_step, num_steps):
+            # Get ids in current batch
+            batch_ids = self.batches[plan[step]]
+
+            # Find ids that need to be transfered to cache
+            ids_to_comm = batch_ids[batch_ids.isin(gpu_cache['data']) == False]
+            num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+            num_rows_to_evic = num_ids_to_comm - num_available_rows
+            num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+
+            # Evic first num_rows_to_evic rows of ids, since the gpu_cache is sorted by batch flags.
+            if num_rows_to_evic > 0:
+                gpu_cache = gpu_cache.iloc[num_rows_to_evic : -1]
+            
+            # Update gpu cache
+            batch_in_cache = df.DataFrame(columns=['data', 'batch_flag'], dtype=int)
+            batch_in_cache['data'] = ids_to_comm
+            batch_in_cache['batch_flag'] = step
+            gpu_cache = df.concat([gpu_cache, batch_in_cache], ignore_index=True)
+            num_available_rows = num_available_rows + num_rows_to_evic - num_ids_to_comm
+            cost_total = cost_total + num_ids_to_comm + num_rows_to_evic
+
+        return cost_total, gpu_cache
+    
+    def Heuristic_Search(self, init_plan: list = None) -> list:
+        self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
+        # self.search_log_l2 = open(os.path.join(self.log_path, "search-log-level-2.txt"), "w")
+
+        if isinstance(init_plan, list):
+            plan = init_plan
+        else:
+            plan = list()
+        
+        unused_batch = [i for i in range(self.batch_num) if i not in plan]
+        random.shuffle(unused_batch)
+
+        # The warm up phase (randomly fill in some steps since the first few steps don't really matter that much.)
+        time_warmup_start = time.time()
+        if len(plan) < self.warm_up_steps:
+            fill_in_length = self.warm_up_steps - len(plan)
+            plan = plan + unused_batch[ : fill_in_length]
+            del unused_batch[ : fill_in_length]
+        cost_total, cache_state = self.Simulate_Cost(plan, None, None, None)
+        time_warmup_finished = time.time()
+
+        # Set up the hotness difference threshold.
+        hotness_diff_threshold = self.hotness_diff_threshold_init_value
+        hotness_diff_history = [hotness_diff_threshold] * self.hotness_diff_threshold_update_period
+        hotness_diff_history_idx = 0
+        hotness_diff_threshold_dynamic_ratio = self.hotness_diff_threshold_base_relax_ratio
+        hotness_diff_threshold_ratio_increment = 0
+
+        output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(cache_state.shape[0] / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+        # print(output_str)
+        self.search_log.write(output_str + "\n")
+
+        # Searching
+        time_last_step = time.time()
+        for step in range(len(plan), self.batch_num):
+            cost_best_choice = LARGE_NUMBER
+            cache_state_best_choice = None
+            best_choice = 0
+            cost_worst_choice = 0
+
+            # Recalibration
+            if step % self.hotness_diff_threshold_recal_steps == 0:
+                hotness_diff_threshold = self.hotness_diff_threshold_init_value
+                hotness_diff_history = [hotness_diff_threshold] * self.hotness_diff_threshold_update_period
+
+            # Search at most self.search_limit steps to find a choice
+            for choice_idx in range(len(unused_batch)):
+                # Suffix _tmp menas current step
+                trial_plan = plan + [unused_batch[choice_idx]]
+                cost_total_tmp, cache_state_tmp = self.Simulate_Cost(trial_plan, cache_state.copy(), step, cost_total)
+                
+                cost_tmp = cost_total_tmp - cost_total
+                if cost_tmp < cost_best_choice:
+                    cost_best_choice = cost_tmp
+                    cache_state_best_choice = cache_state_tmp
+                    best_choice = choice_idx
+                if cost_tmp > cost_worst_choice:
+                    cost_worst_choice = cost_tmp
+                
+                # Early stop conditions
+                hotness_diff_tmp = cost_worst_choice - cost_best_choice
+                if choice_idx > self.hotness_diff_threshold_startup_cap and hotness_diff_tmp > hotness_diff_threshold:
+                    hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment + self.hotness_diff_threshold_increment_relax_ratio
+                    hotness_diff_threshold_dynamic_ratio = self.hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+                    break
+
+                # Late stop conditions
+                if choice_idx > self.search_limit or choice_idx == (len(unused_batch) - 1):
+                    break
+
+                # Level 2 logging
+                # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
+                # self.search_log_l2.write(output_str + "\n")
+            
+            # Finish current step.
+            choice = unused_batch.pop(best_choice)
+            plan.append(choice)
+            cache_state = cache_state_best_choice
+            cost_total = cost_total + cost_best_choice
+            hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
+            hotness_diff_history_idx = (hotness_diff_history_idx + 1) % self.hotness_diff_threshold_update_period
+            hotness_diff_mean = statistics.mean(hotness_diff_history)
+            hotness_diff_threshold = hotness_diff_mean * hotness_diff_threshold_dynamic_ratio
+            random.shuffle(unused_batch)
+
+            # Any step takes more than 0.3s should be considered as slightly late, thus no increment of ralax ratio
+            step_time = time.time() - time_last_step
+            time_last_step = time.time()
+            if step_time > self.hotness_diff_threshold_late_time_cap:
+                hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment * self.hotness_diff_threshold_relax_ratio_penalty_rate
+                hotness_diff_threshold_dynamic_ratio = self.hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+
+            # Logging
+            
+            output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(cache_state.shape[0] / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+            # print(output_str)
+            self.search_log.write(output_str + "\n")
+        
+        output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
+        # print(output_str)
+        self.search_log.write(output_str + "\n")
+
+        self.search_log.close()
+        # self.search_log_l2.close()
+        return cost_total
+
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+    planner = Planner(
+        plan_path=PLAN_PATH, 
+        data_path=DATA_PATH, 
+        log_path="/root/files/coding/data_loading_planner/kaggle_run_1", 
+        cached_rows=GPU_CACHE_SIZE, 
+        warm_up_steps=150, 
+        search_limit=1500, 
+        hotness_diff_threshold_base_relax_ratio=0.84, 
+        hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
+        hotness_diff_threshold_increment_relax_ratio=0.001, 
+        hotness_diff_threshold_late_time_cap=0.6,
+        hotness_diff_threshold_startup_cap=10,
+        hotness_diff_threshold_recal_steps=7600,
+        )
+    dataloading_time = time.time() - start_time
+    cost = planner.Heuristic_Search()
+    planning_time = time.time() - dataloading_time - start_time
+    print("Cost: " + str(cost) + ", dataloading_time: " + str(dataloading_time) + ", planning_time: " + str(planning_time))

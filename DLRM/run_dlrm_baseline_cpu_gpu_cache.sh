@@ -10,4 +10,5 @@ python dlrm_baseline_cpu_gpu_cache.py --arch-sparse-feature-size=16 \
 								--mini-batch-size=1024 \
 								--print-freq=4096 \
 								--print-time \
-								--cache-ratio=0.15
+								--cache-ratio=0.05 \
+								--training-plan-dir=./input/training_plan/

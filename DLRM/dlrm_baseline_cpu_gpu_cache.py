@@ -549,6 +549,7 @@ if __name__ == "__main__":
 	parser.add_argument("--lr-decay-start-step", type=int, default=0)
 	parser.add_argument("--lr-num-decay-steps", type=int, default=0)
 	parser.add_argument("--cache-ratio", type=float, default=0.15)
+	parser.add_argument("--training-plan-dir", type=str, default="./input/training_plan")
 	args = parser.parse_args()
 
 	if args.mlperf_logging:

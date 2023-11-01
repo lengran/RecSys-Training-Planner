@@ -2,6 +2,70 @@ from os import path
 from dlrm_data_pytorch import CriteoDataset
 from cached_embeddingbag import CacheManager
 import torch
+from typing import Sized, Optional, Iterator
+import pandas
+
+
+class PlanedSampler(torch.utils.data.Sampler[int]):
+    r""" Generate batches according to loaded training plan or from a normal batch sampler.
+
+    Args:
+        ready (bool): Work mode. When Ture, the sampler reads batches from a training plan. Otherwise, generate batches from a batch sampler.
+        data_path (os.path): Path to the directory where the sampler read plan and batches in / write batches to.
+        batch_size (int): A parameter to pass into the batch sampler.
+        drop_last (bool): A parameter to pass into the batch sampler.
+        dataset (Dataset): A parameter to pass into the batch sampler.
+    """
+    def __init__(self, ready: bool, data_path: str, batch_size: Optional[int], shuffle: Optional[bool], drop_last: Optional[bool], dataset: Optional[Sized]) -> None:
+        self.data_path = path.abspath(data_path)
+        if not path.exists(self.data_path):
+            raise ValueError(f"The directory to write batches provided doesn't exist. Path ={data_path}")
+        self.ready = ready
+
+        if ready:
+            # If already have a training plan, just load it.
+            self.batches = pandas.read_parquet(path.join(self.data_path, "batches.parquet")).astype(int).values.tolist()
+            self.training_plan = pandas.read_parquet(path.join(self.data_path, "training_plan.parquet")).astype(int).squeeze().tolist()
+            self.length = len(self.training_plan)
+        else:
+            # If not, create samplers to generate batches (which is in method 'generate_batches').
+            if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+                raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
+            if not isinstance(drop_last, bool):
+                raise ValueError(f"drop_last should be a boolean value, but got drop_last={drop_last}")
+            if shuffle:
+                shuffle_sampler = torch.utils.data.RandomSampler(dataset)
+                self.batch_sampler = torch.utils.data.BatchSampler(shuffle_sampler, batch_size, drop_last)
+            else:
+                sequential_sampler = torch.utils.data.SequentialSampler(dataset)
+                self.batch_sampler = torch.utils.data.BatchSampler(sequential_sampler, batch_size, drop_last)
+            self.length = len(self.batch_sampler) 
+    
+    def generate_batches(self):
+        # Write batches to a file so planner can read it and generate a plan.
+        batches = list(self.batch_sampler)
+        dataframe = pandas.DataFrame(batches, columns=[str(i) for i in range(len(batches[0]))]).fillna(-1).astype(int)
+        dataframe.to_parquet(path.join(self.data_path, "batches.parquet"))
+
+    def __iter__(self) -> Iterator[int]:
+        if self.ready:
+            # Return a batch each time.
+            for i in range(self.length):
+                batch_idx = self.training_plan[i]
+                if batch_idx != (self.length - 1):
+                    yield self.batches[batch_idx]
+                else:
+                    # Deal with placebo -1 before acutally returning data indices.
+                    batch = self.batches[batch_idx]
+                    filtered_batch = [i for i in batch if i != -1 ]
+                    yield filtered_batch
+        else:
+            # Work like a normal batch sampler
+            for batch in self.batch_sampler:
+                yield batch
+
+    def __len__(self) -> int:
+        return self.length
 
 class Data_Manager(object):
     '''
@@ -100,16 +164,20 @@ class Data_Manager(object):
             embedding_dim = args.arch_sparse_feature_size
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)
 
+            # First initiate a Sampler then pass it to DataLoaders
+            custom_sampler = PlanedSampler(True, args.training_plan_dir)
+
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
                 self.train_data,
-                batch_size=args.mini_batch_size,
-                shuffle=False,
                 num_workers=args.num_workers,
                 collate_fn=self.collate_cached_wrapper_criteo,
                 pin_memory=False,
-                drop_last=False,  # True
+                sampler=custom_sampler
             )
+            # batch_size=args.mini_batch_size,
+            # shuffle=False,
+            # drop_last=False,  # True
 
             self.test_loader = torch.utils.data.DataLoader(
                 self.test_data,
