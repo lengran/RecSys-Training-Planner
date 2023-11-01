@@ -86,6 +86,7 @@ class Planner(object):
 
         # Misc
         self.log_path = os.path.abspath(log_path)
+        self.plan_path = os.path.abspath(plan_path)
         self.warm_up_steps = min(warm_up_steps, self.batch_num)
         if search_limit is None:
             self.search_limit = self.batch_num * search_ratio
@@ -147,7 +148,7 @@ class Planner(object):
 
         return cost_total, gpu_cache
     
-    def Heuristic_Search(self, init_plan: list = None) -> list:
+    def Heuristic_Search(self, init_plan: list = None) -> int:
         self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
         # self.search_log_l2 = open(os.path.join(self.log_path, "search-log-level-2.txt"), "w")
 
@@ -186,6 +187,7 @@ class Planner(object):
             cache_state_best_choice = None
             best_choice = 0
             cost_worst_choice = 0
+            num_available_rows = self.cached_rows - cache_state.shape[0]
 
             # Recalibration
             if step % self.hotness_diff_threshold_recal_steps == 0:
@@ -195,13 +197,24 @@ class Planner(object):
             # Search at most self.search_limit steps to find a choice
             for choice_idx in range(len(unused_batch)):
                 # Suffix _tmp menas current step
-                trial_plan = plan + [unused_batch[choice_idx]]
-                cost_total_tmp, cache_state_tmp = self.Simulate_Cost(trial_plan, cache_state.copy(), step, cost_total)
+
+                # Actually make the plan and calculate cost [hight cost, don't use this]
+                # trial_plan = plan + [unused_batch[choice_idx]]
+                # cost_total_tmp, cache_state_tmp = self.Simulate_Cost(trial_plan, cache_state.copy(), step, cost_total)
+                # cost_tmp = cost_total_tmp - cost_total
                 
-                cost_tmp = cost_total_tmp - cost_total
+                # Just calculate cost, don't update cache.
+                batch_ids = self.batches[unused_batch[choice_idx]]
+                ids_to_comm = batch_ids[batch_ids.isin(cache_state['data']) == False]
+                num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+                num_rows_to_evic = num_ids_to_comm - num_available_rows
+                num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+                cost_tmp = num_ids_to_comm + num_rows_to_evic
+                
+                # Record a better/worse choice
                 if cost_tmp < cost_best_choice:
                     cost_best_choice = cost_tmp
-                    cache_state_best_choice = cache_state_tmp
+                    # cache_state_best_choice = cache_state_tmp
                     best_choice = choice_idx
                 if cost_tmp > cost_worst_choice:
                     cost_worst_choice = cost_tmp
@@ -221,11 +234,13 @@ class Planner(object):
                 # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
                 # self.search_log_l2.write(output_str + "\n")
             
-            # Finish current step.
+            # Decide current step and actually update cache state.
             choice = unused_batch.pop(best_choice)
             plan.append(choice)
-            cache_state = cache_state_best_choice
-            cost_total = cost_total + cost_best_choice
+            # cache_state = cache_state_best_choice
+            # cost_total = cost_total + cost_best_choice
+            cost_total, cache_state = self.Simulate_Cost(plan, cache_state.copy(), step, cost_total)
+
             hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
             hotness_diff_history_idx = (hotness_diff_history_idx + 1) % self.hotness_diff_threshold_update_period
             hotness_diff_mean = statistics.mean(hotness_diff_history)
@@ -251,8 +266,11 @@ class Planner(object):
 
         self.search_log.close()
         # self.search_log_l2.close()
+        self.plan = plan
         return cost_total
 
+    def to_parquet(self) -> None:
+        df.DataFrame({'plan': self.plan}).to_parquet(os.path.join(self.plan_path, "training_plan.parquet"))
 
 
 if __name__ == "__main__":
@@ -260,7 +278,7 @@ if __name__ == "__main__":
     planner = Planner(
         plan_path=PLAN_PATH, 
         data_path=DATA_PATH, 
-        log_path="/root/files/coding/data_loading_planner/kaggle_run_1", 
+        log_path="/root/files/coding/data_loading_planner/kaggle_run_2", 
         cached_rows=GPU_CACHE_SIZE, 
         warm_up_steps=150, 
         search_limit=1500, 
@@ -275,3 +293,4 @@ if __name__ == "__main__":
     cost = planner.Heuristic_Search()
     planning_time = time.time() - dataloading_time - start_time
     print("Cost: " + str(cost) + ", dataloading_time: " + str(dataloading_time) + ", planning_time: " + str(planning_time))
+    planner.to_parquet()
