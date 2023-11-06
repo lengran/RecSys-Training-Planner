@@ -107,18 +107,18 @@ class Planner(object):
         else:
             self.hotness_diff_threshold_recal_steps = LARGE_NUMBER
         
-    def Simulate_Cost(self, plan: list, init_cache_state: Optional[df.DataFrame], start_step: Optional[int], start_cost: Optional[int]):
+    def Simulate_Cost(self, plan: list, init_cache_state: Optional[df.Series], start_step: Optional[int], start_cost: Optional[int]):
         '''
         Calculate cost of a given route.
         '''
 
         num_steps = len(plan)
-        if isinstance(init_cache_state, df.DataFrame):
+        if isinstance(init_cache_state, df.Series):
             gpu_cache = init_cache_state
             cost_total = start_cost
-            num_available_rows = self.cached_rows - gpu_cache.shape[0]
+            num_available_rows = self.cached_rows - len(gpu_cache)
         else:
-            gpu_cache = df.DataFrame(columns=['data', 'batch_flag'], dtype=int)
+            gpu_cache = df.Series(dtype=int)
             cost_total = 0
             start_step = 0
             num_available_rows = self.cached_rows
@@ -129,7 +129,7 @@ class Planner(object):
             batch_ids = self.batches[plan[step]]
 
             # Find ids that need to be transfered to cache
-            ids_to_comm = batch_ids[batch_ids.isin(gpu_cache['data']) == False]
+            ids_to_comm = batch_ids[batch_ids.isin(gpu_cache) == False]
             num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
             num_rows_to_evic = num_ids_to_comm - num_available_rows
             num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
@@ -139,10 +139,7 @@ class Planner(object):
                 gpu_cache = gpu_cache.iloc[num_rows_to_evic : -1]
             
             # Update gpu cache
-            batch_in_cache = df.DataFrame(columns=['data', 'batch_flag'], dtype=int)
-            batch_in_cache['data'] = ids_to_comm
-            batch_in_cache['batch_flag'] = step
-            gpu_cache = df.concat([gpu_cache, batch_in_cache], ignore_index=True)
+            gpu_cache = df.concat([gpu_cache, ids_to_comm], ignore_index=True)
             num_available_rows = num_available_rows + num_rows_to_evic - num_ids_to_comm
             cost_total = cost_total + num_ids_to_comm + num_rows_to_evic
 
@@ -176,7 +173,7 @@ class Planner(object):
         hotness_diff_threshold_dynamic_ratio = self.hotness_diff_threshold_base_relax_ratio
         hotness_diff_threshold_ratio_increment = 0
 
-        output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(cache_state.shape[0] / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+        output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
         # print(output_str)
         self.search_log.write(output_str + "\n")
 
@@ -187,7 +184,7 @@ class Planner(object):
             cache_state_best_choice = None
             best_choice = 0
             cost_worst_choice = 0
-            num_available_rows = self.cached_rows - cache_state.shape[0]
+            num_available_rows = self.cached_rows - len(cache_state)
 
             # Recalibration
             if step % self.hotness_diff_threshold_recal_steps == 0:
@@ -205,7 +202,7 @@ class Planner(object):
                 
                 # Just calculate cost, don't update cache.
                 batch_ids = self.batches[unused_batch[choice_idx]]
-                ids_to_comm = batch_ids[batch_ids.isin(cache_state['data']) == False]
+                ids_to_comm = batch_ids[batch_ids.isin(cache_state) == False]
                 num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
                 num_rows_to_evic = num_ids_to_comm - num_available_rows
                 num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
@@ -238,8 +235,13 @@ class Planner(object):
             choice = unused_batch.pop(best_choice)
             plan.append(choice)
             # cache_state = cache_state_best_choice
-            # cost_total = cost_total + cost_best_choice
-            cost_total, cache_state = self.Simulate_Cost(plan, cache_state.copy(), step, cost_total)
+            cost_total = cost_total + cost_best_choice
+            batch_ids = self.batches[choice]
+            ids_to_comm = batch_ids[batch_ids.isin(cache_state) == False]
+            num_rows_to_evic = len(ids_to_comm) - num_available_rows
+            if num_rows_to_evic > 0:
+                cache_state = cache_state.iloc[num_rows_to_evic : -1]
+            cache_state = df.concat([cache_state, ids_to_comm], ignore_index=True)
 
             hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
             hotness_diff_history_idx = (hotness_diff_history_idx + 1) % self.hotness_diff_threshold_update_period
@@ -256,7 +258,7 @@ class Planner(object):
 
             # Logging
             
-            output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(cache_state.shape[0] / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+            output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
             # print(output_str)
             self.search_log.write(output_str + "\n")
         
@@ -275,6 +277,20 @@ class Planner(object):
 
 if __name__ == "__main__":
     start_time = time.time()
+    print("Initializing the planner...")
+
+    '''
+    Recommended hyper parameters for criteo kaggle dataset:
+        warm_up_steps=150, 
+        search_limit=1500, 
+        hotness_diff_threshold_base_relax_ratio=0.8, 
+        hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
+        hotness_diff_threshold_increment_relax_ratio=0.001, 
+        hotness_diff_threshold_late_time_cap=0.35,
+        hotness_diff_threshold_startup_cap=10,
+        hotness_diff_threshold_recal_steps=0,
+    '''
+    
     planner = Planner(
         plan_path=PLAN_PATH, 
         data_path=DATA_PATH, 
@@ -282,14 +298,15 @@ if __name__ == "__main__":
         cached_rows=GPU_CACHE_SIZE, 
         warm_up_steps=150, 
         search_limit=1500, 
-        hotness_diff_threshold_base_relax_ratio=0.84, 
+        hotness_diff_threshold_base_relax_ratio=0.8, 
         hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
         hotness_diff_threshold_increment_relax_ratio=0.001, 
-        hotness_diff_threshold_late_time_cap=0.6,
-        hotness_diff_threshold_startup_cap=10,
-        hotness_diff_threshold_recal_steps=7600,
+        hotness_diff_threshold_late_time_cap=0.35,
+        hotness_diff_threshold_startup_cap=9,
+        hotness_diff_threshold_recal_steps=0,
         )
     dataloading_time = time.time() - start_time
+    print("Planner initialized. Dataset loaded. (" + str(dataloading_time) + "s)\nStart planning...")
     cost = planner.Heuristic_Search()
     planning_time = time.time() - dataloading_time - start_time
     print("Cost: " + str(cost) + ", dataloading_time: " + str(dataloading_time) + ", planning_time: " + str(planning_time))
