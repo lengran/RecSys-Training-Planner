@@ -2,21 +2,36 @@ from os import path
 from dlrm_data_pytorch import CriteoDataset
 from cached_embeddingbag import CacheManager
 import torch
-from typing import Sized, Optional, Iterator
+from typing import Sized, Optional, Iterator, List
 import pandas
 
+class CriteoDataset_WithListIndiceSupport(CriteoDataset):
+    def __getitem__(self, index):
+        if isinstance(index, list):
+            return [self[idx] for idx in index]
 
-class PlanedSampler(torch.utils.data.Sampler[int]):
+        return super().__getitem__(index)
+
+class PlanedSampler(torch.utils.data.Sampler[List[int]]):
     r""" Generate batches according to loaded training plan or from a normal batch sampler.
 
     Args:
         ready (bool): Work mode. When Ture, the sampler reads batches from a training plan. Otherwise, generate batches from a batch sampler.
         data_path (os.path): Path to the directory where the sampler read plan and batches in / write batches to.
         batch_size (int): A parameter to pass into the batch sampler.
+        shuffle (bool): If the sequence of data need to be shuffled before passing into the batch sampler.
         drop_last (bool): A parameter to pass into the batch sampler.
         dataset (Dataset): A parameter to pass into the batch sampler.
     """
-    def __init__(self, ready: bool, data_path: str, batch_size: Optional[int], shuffle: Optional[bool], drop_last: Optional[bool], dataset: Optional[Sized]) -> None:
+    def __init__(
+            self, 
+            ready: bool, 
+            data_path: str, 
+            batch_size: Optional[int], 
+            shuffle: Optional[bool], 
+            drop_last: Optional[bool], 
+            dataset: Optional[Sized]
+            ) -> None:
         self.data_path = path.abspath(data_path)
         if not path.exists(self.data_path):
             raise ValueError(f"The directory to write batches provided doesn't exist. Path ={data_path}")
@@ -39,30 +54,26 @@ class PlanedSampler(torch.utils.data.Sampler[int]):
             else:
                 sequential_sampler = torch.utils.data.SequentialSampler(dataset)
                 self.batch_sampler = torch.utils.data.BatchSampler(sequential_sampler, batch_size, drop_last)
-            self.length = len(self.batch_sampler) 
+            self.batches = list(self.batch_sampler)
+            self.length = len(self.batches) 
+            self.training_plan = [i for i in range(self.length)]
     
     def generate_batches(self):
         # Write batches to a file so planner can read it and generate a plan.
-        batches = list(self.batch_sampler)
-        dataframe = pandas.DataFrame(batches, columns=[str(i) for i in range(len(batches[0]))]).fillna(-1).astype(int)
+        dataframe = pandas.DataFrame(self.batches, columns=[str(i) for i in range(len(self.batches[0]))]).fillna(-1).astype(int)
         dataframe.to_parquet(path.join(self.data_path, "batches.parquet"))
 
     def __iter__(self) -> Iterator[int]:
-        if self.ready:
-            # Return a batch each time.
-            for i in range(self.length):
-                batch_idx = self.training_plan[i]
-                if batch_idx != (self.length - 1):
-                    yield self.batches[batch_idx]
-                else:
-                    # Deal with placebo -1 before acutally returning data indices.
-                    batch = self.batches[batch_idx]
-                    filtered_batch = [i for i in batch if i != -1 ]
-                    yield filtered_batch
-        else:
-            # Work like a normal batch sampler
-            for batch in self.batch_sampler:
-                yield batch
+        # Return a batch each time.
+        for i in range(self.length):
+            batch_idx = self.training_plan[i]
+            if batch_idx != (self.length - 1):
+                yield self.batches[batch_idx]
+            else:
+                # Deal with placebo -1 before acutally returning data indices.
+                batch = self.batches[batch_idx]
+                filtered_batch = [i for i in batch if i != -1 ]
+                yield filtered_batch
 
     def __len__(self) -> int:
         return self.length
@@ -128,11 +139,11 @@ class Data_Manager(object):
                 raise NotImplementedError()
         else:
             # Datasets
-            self.train_data = CriteoDataset(
+            self.train_data = CriteoDataset_WithListIndiceSupport(
                 args.data_set,
                 args.max_ind_range,
                 args.data_sub_sample_rate,
-                args.data_randomize,
+                None, # args.data_randomize,
                 "train",
                 args.raw_data_file,
                 args.processed_data_file,
@@ -140,11 +151,11 @@ class Data_Manager(object):
                 args.dataset_multiprocessing
             )
 
-            self.test_data = CriteoDataset(
+            self.test_data = CriteoDataset_WithListIndiceSupport(
                 args.data_set,
                 args.max_ind_range,
                 args.data_sub_sample_rate,
-                args.data_randomize,
+                None, #args.data_randomize,
                 "test",
                 args.raw_data_file,
                 args.processed_data_file,
@@ -164,8 +175,9 @@ class Data_Manager(object):
             embedding_dim = args.arch_sparse_feature_size
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)
 
-            # First initiate a Sampler then pass it to DataLoaders
-            custom_sampler = PlanedSampler(True, args.training_plan_dir)
+            # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
+            # custom_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
+            custom_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
@@ -194,9 +206,9 @@ class Data_Manager(object):
         Customized collate function that update cache.
         '''
         # where each tuple is (X_int, X_cat, y)
-        transposed_data = list(zip(*list_of_tuples))
+        transposed_data = list(zip(*list_of_tuples[0]))
 
-        X_int = torch.log(torch.tensor(transposed_data[0], dtype=torch.float) + 1)
+        X_int = torch.log(torch.tensor(transposed_data[0], dtype=torch.float32) + 1)
         X_cat = torch.tensor(transposed_data[1], dtype=torch.long)
         T = torch.tensor(transposed_data[2], dtype=torch.float32).view(-1, 1)
 

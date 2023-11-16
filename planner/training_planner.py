@@ -146,7 +146,7 @@ class Planner(object):
         return cost_total, gpu_cache
     
     def Heuristic_Search(self, init_plan: list = None) -> int:
-        self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
+        # self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
         # self.search_log_l2 = open(os.path.join(self.log_path, "search-log-level-2.txt"), "w")
 
         if isinstance(init_plan, list):
@@ -173,9 +173,9 @@ class Planner(object):
         hotness_diff_threshold_dynamic_ratio = self.hotness_diff_threshold_base_relax_ratio
         hotness_diff_threshold_ratio_increment = 0
 
-        output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+        # output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
         # print(output_str)
-        self.search_log.write(output_str + "\n")
+        # self.search_log.write(output_str + "\n")
 
         # Searching
         time_last_step = time.time()
@@ -258,15 +258,15 @@ class Planner(object):
 
             # Logging
             
-            output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+            # output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
             # print(output_str)
-            self.search_log.write(output_str + "\n")
+            # self.search_log.write(output_str + "\n")
         
-        output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
+        # output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
         # print(output_str)
-        self.search_log.write(output_str + "\n")
+        # self.search_log.write(output_str + "\n")
 
-        self.search_log.close()
+        # self.search_log.close()
         # self.search_log_l2.close()
         self.plan = plan
         return cost_total
@@ -302,7 +302,7 @@ if __name__ == "__main__":
         hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
         hotness_diff_threshold_increment_relax_ratio=0.001, 
         hotness_diff_threshold_late_time_cap=0.35,
-        hotness_diff_threshold_startup_cap=9,
+        hotness_diff_threshold_startup_cap=8,
         hotness_diff_threshold_recal_steps=0,
         )
     dataloading_time = time.time() - start_time

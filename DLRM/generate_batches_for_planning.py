@@ -15,5 +15,6 @@ if __name__ == "__main__":
                 False
             )
 
-    sampler = PlanedSampler(False, "./input/training_plan/", batch_size=1024, shuffle=False, drop_last=False, dataset=train_data)
+    # Change this parameters according to args in run_dlrm_baseline_cpu_gpu_cache.sh
+    sampler = PlanedSampler(False, "./input/training_plan/", batch_size=1024, shuffle=True, drop_last=False, dataset=train_data)
     sampler.generate_batches()
