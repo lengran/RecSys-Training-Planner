@@ -302,7 +302,7 @@ if __name__ == "__main__":
         hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
         hotness_diff_threshold_increment_relax_ratio=0.001, 
         hotness_diff_threshold_late_time_cap=0.35,
-        hotness_diff_threshold_startup_cap=8,
+        hotness_diff_threshold_startup_cap=12,
         hotness_diff_threshold_recal_steps=0,
         )
     dataloading_time = time.time() - start_time

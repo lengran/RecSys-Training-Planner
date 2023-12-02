@@ -973,6 +973,11 @@ if __name__ == "__main__":
 					# for l in mlp.layers:
 					#     if hasattr(l, 'weight'):
 					#          print(l.weight.grad.norm().item())
+
+					# update cache row's batch flags
+					with torch.no_grad():
+						for i in range(len(dlrm.emb_l)):
+							dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
 					end_backward = time_wrap(use_gpu)
 
 					# optimizer

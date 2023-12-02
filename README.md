@@ -14,6 +14,34 @@ Date:   Sun Sep 17 17:10:02 2023 -0700
     Updated
 ```
 
+### Necessary code modifications for my pytorch runtime environment
+
+1. Replace
+
+```python
+with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
+```
+
+With
+
+```python
+with torch.autograd.profiler.profile(enabled=args.enable_profiling, use_cuda=use_gpu) as prof:
+```
+
+2. Replace
+
+dlrm.fae.py line 1390 and line 1726
+
+```python
+hot_row = emb_dict[(emb_no, emb_row)]
+```
+
+With
+
+```python
+hot_row = int(emb_dict[(emb_no, emb_row)])
+```
+
 ## Note
 
 Both qr\_flag and md\_flag for the embedding layer are not supported.

@@ -5,7 +5,7 @@ import torch
 from typing import Sized, Optional, Iterator, List
 import pandas
 
-class CriteoDataset_WithListIndiceSupport(CriteoDataset):
+class CriteoDataset_WithListIndexSupport(CriteoDataset):
     def __getitem__(self, index):
         if isinstance(index, list):
             return [self[idx] for idx in index]
@@ -139,7 +139,7 @@ class Data_Manager(object):
                 raise NotImplementedError()
         else:
             # Datasets
-            self.train_data = CriteoDataset_WithListIndiceSupport(
+            self.train_data = CriteoDataset_WithListIndexSupport(
                 args.data_set,
                 args.max_ind_range,
                 args.data_sub_sample_rate,
@@ -151,7 +151,7 @@ class Data_Manager(object):
                 args.dataset_multiprocessing
             )
 
-            self.test_data = CriteoDataset_WithListIndiceSupport(
+            self.test_data = CriteoDataset_WithListIndexSupport(
                 args.data_set,
                 args.max_ind_range,
                 args.data_sub_sample_rate,
@@ -176,8 +176,9 @@ class Data_Manager(object):
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)
 
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
-            # custom_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
-            custom_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
+            # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
+            custom_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
+            # custom_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(

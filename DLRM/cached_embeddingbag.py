@@ -523,9 +523,9 @@ class CachedEmbeddingBag(torch.nn.Module):
         if shape_hook is not None:
             embeddings = shape_hook(embeddings)
         
-        # Shall we update batch flag here?
-        with torch.no_grad():
-            self.cache_weight_mgr.update_batch_flag(embedding_bag_id=self.embedding_bag_id)
+        # Shall we update batch flag here? No, the cache row should only be released after backward propagation.
+        # with torch.no_grad():
+        #     self.cache_weight_mgr.update_batch_flag(embedding_bag_id=self.embedding_bag_id)
 
         return embeddings
     
