@@ -129,7 +129,7 @@ class CacheManager(torch.nn.Module):
             persistent=False,
         )
         self._finished_batch = -1
-        self._num_binded_embedding_bag = 0
+        # self._num_binded_embedding_bag = 0
     
     def _init_weight(self, weight: torch.Tensor) -> None:
         if self.cuda_row_num > 0:
@@ -386,24 +386,29 @@ class CacheManager(torch.nn.Module):
         gpu_idx = self.inverted_cached_idx.index_select(0, cpu_idx)
         return gpu_idx
 
+    """
     def register_embedding_bag(self) -> int:
         self._num_binded_embedding_bag = self._num_binded_embedding_bag + 1
         self._embedding_bag_update_flags = 0
         return self._num_binded_embedding_bag
+    """
     
     @torch.no_grad()
-    def update_batch_flag(self, batch_pointer: int = None, embedding_bag_id: int = None) -> None:
-        # TODO: Improve efficiency under parallel excution, remove shared read-and-write data hotspot.
+    def update_batch_flag(self, batch_pointer: int = None) -> None:#, embedding_bag_id: int = None) -> None:
+        # TODO: Improve efficiency under parallel excution, remove shared read-and-write data hotspot. UPDATE: 20231205 Can we consider this TODO done?
         # Hard set batch_pointer
         if batch_pointer is not None:
             self._finished_batch = batch_pointer
         # Update batch_pointer automaticlly
         else:
+            """
             self._embedding_bag_update_flags = self._embedding_bag_update_flags + 1
             # Only update batch_pointer when all embedding layers have finished computing this batch
             if self._embedding_bag_update_flags >= self._num_binded_embedding_bag:
                 self._embedding_bag_update_flags = 0
                 self._finished_batch = self._finished_batch + 1
+            """
+            self._finished_batch = self._finished_batch + 1
 
     @property
     def cuda_available_row_num(self):

@@ -86,7 +86,9 @@ from tricks.qr_embedding_bag import QREmbeddingBag
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 # Cached Embedding classes
+from .. import cached_embeddingbag
 from cached_embeddingbag import CachedEmbeddingBag
+# from ../cached_embeddingbag import CachedEmbeddingBag
 from dlrm_data_pytorch_cache import Data_Manager
 
 import sklearn.metrics
@@ -976,8 +978,9 @@ if __name__ == "__main__":
 
 					# update cache row's batch flags
 					with torch.no_grad():
-						for i in range(len(dlrm.emb_l)):
-							dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
+						dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
+						# for i in range(len(dlrm.emb_l)):
+						# 	dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
 					end_backward = time_wrap(use_gpu)
 
 					# optimizer
