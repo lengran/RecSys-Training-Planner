@@ -490,7 +490,7 @@ class CachedEmbeddingBag(torch.nn.Module):
             self.cache_weight_mgr = CacheManager(_weight, cuda_row_num, buffer_size, pin_weight)
         else:
             self.cache_weight_mgr = cache_mgr
-            self.embedding_bag_id = self.cache_weight_mgr.register_embedding_bag()
+            # self.embedding_bag_id = self.cache_weight_mgr.register_embedding_bag()
             self.cat_offset = cat_offset
             torch.nn.init.normal_(self.cache_weight_mgr.weight.data[cat_offset : cat_offset + self.num_embeddings, :])
         

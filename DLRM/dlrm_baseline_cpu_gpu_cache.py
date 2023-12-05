@@ -86,9 +86,7 @@ from tricks.qr_embedding_bag import QREmbeddingBag
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 # Cached Embedding classes
-from .. import cached_embeddingbag
 from cached_embeddingbag import CachedEmbeddingBag
-# from ../cached_embeddingbag import CachedEmbeddingBag
 from dlrm_data_pytorch_cache import Data_Manager
 
 import sklearn.metrics
