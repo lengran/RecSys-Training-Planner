@@ -369,7 +369,23 @@ class CacheManager(torch.nn.Module):
         Returns:
             torch.Tensor: a list tensor (1D), contains the gpu_row_idxs.
         """
-        victim_gpu_rows = torch.nonzero(self.batch_flags < self._finished_batch).squeeze(1)[ : evict_num]
+        # victim_gpu_rows = torch.nonzero(self.batch_flags < self._finished_batch).squeeze(1)[ : evict_num]
+        found_enough_rows = False
+        while not found_enough_rows:
+            # First find idx of used rows. Leave unused rows alone.
+            idx_used_gpu_rows = torch.nonzero(self.cached_idx_map != -1).squeeze(1)
+            # Find idx of idx_used_gpu_rows of which the row's batch_flag is smaller than self._finished_batch.
+            idx_idx_used_gpu_rows = torch.nonzero(self.batch_flags[idx_used_gpu_rows] <= self._finished_batch).squeeze(1)
+            
+            # if we have found enough slot
+            if idx_idx_used_gpu_rows.numel() <=  evict_num:
+                print("[Finding evict idx]: finished " + str(self._finished_batch) + ", max batch stamp in cache" + str(torch.max(self.batch_flags)) + ", num found victims " + str(idx_idx_used_gpu_rows.numel()) + ", evict_num: " + str(evict_num))
+                # import pdb; pdb.set_trace()
+                raise ValueError("No enough rows in gpu cache. Finished batch_flag " + str(self._finished_batch) + ", max batch stamp in cache" + str(torch.max(self.batch_flags)) + ", num found victims " + str(idx_idx_used_gpu_rows.numel()) + ", evict_num: " + str(evict_num))
+            else:
+                victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[ : evict_num]]
+                found_enough_rows = True
+
         return victim_gpu_rows
 
     @torch.no_grad()

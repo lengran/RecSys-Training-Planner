@@ -98,7 +98,7 @@ import sklearn.metrics
 from torch.optim.lr_scheduler import _LRScheduler
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 # os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
@@ -974,15 +974,16 @@ if __name__ == "__main__":
 					#     if hasattr(l, 'weight'):
 					#          print(l.weight.grad.norm().item())
 
+					end_backward = time_wrap(use_gpu)
+
+					# optimizer
+					optimizer.step()
+
 					# update cache row's batch flags
 					with torch.no_grad():
 						dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
 						# for i in range(len(dlrm.emb_l)):
 						# 	dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
-					end_backward = time_wrap(use_gpu)
-
-					# optimizer
-					optimizer.step()
 
 					end_optimizing = time_wrap(use_gpu)
 
