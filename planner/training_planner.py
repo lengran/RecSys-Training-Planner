@@ -13,13 +13,17 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 LARGE_NUMBER = 10000000
 
-GPU_CACHE_SIZE = int(33762577 * 0.05)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
-DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
-PLAN_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/training_plan/"
+DLRM_GPU_CACHE_SIZE = int(33762577 * 0.05)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
+TBSM_GPU_CACHE_SIZE = int(5159457 * 0.05)                                                       # num of rows * cache_ratio
+DLRM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
+TBSM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/TBSM/output/taobao_train_t20.npz"
+DLRM_PLAN_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/training_plan/"
+TBSM_PLAN_PATH = "/root/files/coding/RecSys-Training-Planner/TBSM/input/training_plan/"
 
 class Planner(object):
     def __init__(
             self, 
+            dataset: str,
             plan_path: str, 
             data_path: str, 
             log_path: str, 
@@ -38,6 +42,7 @@ class Planner(object):
             ) -> None:
         '''
         args:
+            dataset (str): Should be "criteo" or "taobao".
             plan_path (str): Directory to read batches from and write generated plan to.
             data_path (str): Path to the dataset file (a numpy xyz file).
             log_path (str): A directory to store planning logs.
@@ -53,38 +58,23 @@ class Planner(object):
             hotness_diff_threshold_startup_cap (int): The hotness_diff threshold should only be effective after searching such many choices. (for the heuristic searching algorithm)
             hotness_diff_threshold_recal_steps (int): After searching such many steps, recalibrate the threshold.
         '''
-        # Read cat_data
-        data = np.load(os.path.abspath(data_path))
-        X_cat = data["X_cat"]                                                                                               # categorical feature
-        cat_data = df.DataFrame(X_cat).astype(int)                                                                          # each column is a row of categorical features in the original dataset
-
         # Read the batches.
+        loading_begin = time.time()
+        print("Loading data...")
         batches = df.read_parquet(os.path.join(os.path.abspath(plan_path), "batches.parquet")).transpose()             # each column is a batch of indices of dataset's row
         self.batch_num = batches.shape[1]
         self.batch_size = batches.shape[0]
-        
-        self.cached_rows = cached_rows
-        self.cat_counts = list(data["counts"])
 
-        # Convert id from id_in_cat to unique_id_in_dataset
-        cat_offsets = list()
-        tmp_offset = 0
-        for i in range(len(self.cat_counts)):
-            cat_offsets.append(tmp_offset)
-            tmp_offset = tmp_offset + self.cat_counts[i]
-        cat_offsets = df.Series(cat_offsets)
-        cat_data = cat_data + cat_offsets
-
-        # Convert batches of indices to batches of ids
-        self.batches = list()
-        for i in range(0, self.batch_num - 1):
-            batch_indices = batches[i]
-            self.batches.append(cat_data.iloc[batch_indices].stack().unique())
-        # For batches[self.batch_num - 1], deal with -1s
-        batch_indices = df.Series([i for i in batches[self.batch_num - 1].values.tolist() if i != -1])
-        self.batches.append(cat_data.iloc[batch_indices].stack().unique())
+        # Read dataset and process it.
+        if dataset == "criteo":
+            self.load_criteo_data(data_path, batches)
+        else:
+            self.load_taobao_data(data_path, batches)
+        loading_end = time.time()
+        print("Data loading finished. (" + str(loading_end - loading_begin) + "s)")
 
         # Misc
+        self.cached_rows = cached_rows
         self.log_path = os.path.abspath(log_path)
         self.plan_path = os.path.abspath(plan_path)
         self.warm_up_steps = min(warm_up_steps, self.batch_num)
@@ -107,6 +97,65 @@ class Planner(object):
         else:
             self.hotness_diff_threshold_recal_steps = LARGE_NUMBER
         
+    def load_criteo_data(self, data_path, batches):
+        """
+        Returned data:
+            self.batches (list of df.Series): Categorical objects contained in each batch. (This is basically all we need from the dataset.) 
+        """
+        # Read cat_data
+        data = np.load(os.path.abspath(data_path))
+        X_cat = data["X_cat"]                                                                                               # categorical feature
+        cat_data = df.DataFrame(X_cat).astype(int)                                                                          # each column is a row of categorical features in the original dataset
+        
+        # Count size of features.
+        self.cat_counts = list(data["counts"])
+
+        # Convert id from id_in_cat to unique_id_in_dataset
+        cat_offsets = list()
+        tmp_offset = 0
+        for i in range(len(self.cat_counts)):
+            cat_offsets.append(tmp_offset)
+            tmp_offset = tmp_offset + self.cat_counts[i]
+        cat_offsets = df.Series(cat_offsets)
+        cat_data = cat_data + cat_offsets
+
+        # Convert batches of indices to batches of ids
+        self.batches = list()
+        for i in range(0, self.batch_num - 1):
+            batch_indices = batches[i]
+            self.batches.append(cat_data.iloc[batch_indices].stack().unique())
+        # For batches[self.batch_num - 1], deal with -1s
+        batch_indices = df.Series([i for i in batches[self.batch_num - 1].values.tolist() if i != -1])
+        self.batches.append(cat_data.iloc[batch_indices].stack().unique())
+
+    def load_taobao_data(self, data_path, batches):
+        """
+        Returned data:
+            self.batches (list of df.Series): Categorical objects contained in each batch. (This is basically all we need from the dataset.) 
+        """
+        # Read cat_data
+        data = np.load(os.path.abspath(data_path))
+        X_cat = data["X_cat"]                                                                                               # categorical feature
+
+        # Count size of features.
+        self.cat_counts = [987994, 4162024, 9439]
+
+        # Convert id from id_in_cat to unique_id_in_dataset
+        cat_offsets = list()
+        tmp_offset = 0
+        for i in range(len(self.cat_counts)):
+            cat_offsets.append(tmp_offset)
+            tmp_offset = tmp_offset + self.cat_counts[i]
+        for i in range(len(cat_offsets)):
+            X_cat[i] = X_cat[i] + cat_offsets[i]
+        
+        # Calculate objs in batch
+        rotated_cat_data = np.swapaxes(X_cat, 0, 1)
+        self.batches = list()
+        for i in range(batches.shape[1]):
+            indices = batches[i].to_numpy()
+            self.batches.append(df.concat([df.Series(rotated_cat_data[indices].flatten())]).unique())
+
     def Simulate_Cost(self, plan: list, init_cache_state: Optional[df.Series], start_step: Optional[int], start_cost: Optional[int]):
         '''
         Calculate cost of a given route.
@@ -146,8 +195,8 @@ class Planner(object):
         return cost_total, gpu_cache
     
     def Heuristic_Search(self, init_plan: list = None) -> int:
-        # self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
-        # self.search_log_l2 = open(os.path.join(self.log_path, "search-log-level-2.txt"), "w")
+        self.search_log = open(os.path.join(self.log_path, "search-log.txt"), "w")
+        self.search_log_l2 = open(os.path.join(self.log_path, "search-log-level-2.txt"), "w")
 
         if isinstance(init_plan, list):
             plan = init_plan
@@ -228,8 +277,8 @@ class Planner(object):
                     break
 
                 # Level 2 logging
-                # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
-                # self.search_log_l2.write(output_str + "\n")
+                output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
+                self.search_log_l2.write(output_str + "\n")
             
             # Decide current step and actually update cache state.
             choice = unused_batch.pop(best_choice)
@@ -258,16 +307,16 @@ class Planner(object):
 
             # Logging
             
-            # output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+            output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
             # print(output_str)
-            # self.search_log.write(output_str + "\n")
+            self.search_log.write(output_str + "\n")
         
         # output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
         # print(output_str)
         # self.search_log.write(output_str + "\n")
 
-        # self.search_log.close()
-        # self.search_log_l2.close()
+        self.search_log.close()
+        self.search_log_l2.close()
         self.plan = plan
         return cost_total
 
@@ -291,20 +340,38 @@ if __name__ == "__main__":
         hotness_diff_threshold_recal_steps=0,
     '''
     
+    # planner = Planner(
+    #     dataset="criteo",
+    #     plan_path=DLRM_PLAN_PATH, 
+    #     data_path=DLRM_DATA_PATH, 
+    #     log_path="/root/files/coding/data_loading_planner/kaggle_run_2", 
+    #     cached_rows=DLRM_GPU_CACHE_SIZE, 
+    #     warm_up_steps=150, 
+    #     search_limit=2000, 
+    #     hotness_diff_threshold_base_relax_ratio=0.9, 
+    #     hotness_diff_threshold_relax_ratio_penalty_rate=0.5, 
+    #     hotness_diff_threshold_increment_relax_ratio=0.001, 
+    #     hotness_diff_threshold_late_time_cap=1,
+    #     hotness_diff_threshold_startup_cap=100,
+    #     hotness_diff_threshold_recal_steps=0,
+    #     )
+    
     planner = Planner(
-        plan_path=PLAN_PATH, 
-        data_path=DATA_PATH, 
-        log_path="/root/files/coding/data_loading_planner/kaggle_run_2", 
-        cached_rows=GPU_CACHE_SIZE, 
-        warm_up_steps=150, 
-        search_limit=1500, 
-        hotness_diff_threshold_base_relax_ratio=0.8, 
-        hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
+        dataset="taobao",
+        plan_path=TBSM_PLAN_PATH, 
+        data_path=TBSM_DATA_PATH, 
+        log_path="/root/files/coding/data_loading_planner/taobao_run", 
+        cached_rows=TBSM_GPU_CACHE_SIZE, 
+        warm_up_steps=0, 
+        search_limit=42728, 
+        hotness_diff_threshold_base_relax_ratio=0.9, 
+        hotness_diff_threshold_relax_ratio_penalty_rate=0.5, 
         hotness_diff_threshold_increment_relax_ratio=0.001, 
-        hotness_diff_threshold_late_time_cap=0.35,
-        hotness_diff_threshold_startup_cap=12,
+        hotness_diff_threshold_late_time_cap=1,
+        hotness_diff_threshold_startup_cap=2000,
         hotness_diff_threshold_recal_steps=0,
         )
+    
     dataloading_time = time.time() - start_time
     print("Planner initialized. Dataset loaded. (" + str(dataloading_time) + "s)\nStart planning...")
     cost = planner.Heuristic_Search()
