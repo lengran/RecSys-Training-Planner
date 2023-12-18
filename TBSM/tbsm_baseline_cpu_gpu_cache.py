@@ -27,8 +27,8 @@ from torch.utils.tensorboard import SummaryWriter
 import tbsm_data_pytorch as tp
 from tbsm_data_pytorch_cache import DataManager
 
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # set python, numpy and torch random seeds
 def set_seed(seed, use_gpu):
@@ -521,6 +521,8 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 	backward_time = 0
 	optimizer_time = 0
 
+	start_time = time.time()
+
 	for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
 		if j >= nbatches:
 			break
@@ -663,6 +665,9 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 			print("Best_test_Accuracy ", max_gA_test * 100)
 			print("\n")
 
+	end_time = time.time()
+	print("=========================================================\nTotal time: " + str(end_time - start_time) + "\n=========================================================")
+	
 	if not isMainTraining:
 		return gA_test
 

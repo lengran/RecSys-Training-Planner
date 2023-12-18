@@ -4,7 +4,7 @@ import os
 from collections import deque
 
 LOG_PATH = "/root/files/coding/data_loading_planner/plot_source"
-PLOT_PATH = "/root/files/coding/data_loading_planner/kaggle_run_0"
+PLOT_PATH = "/root/files/coding/data_loading_planner/taobao_run"
 
 def Read_Steps():
     steps = dict()
@@ -42,5 +42,5 @@ if __name__ == "__main__":
     
     # # Print plots for steps
     steps = Read_Steps()
-    Print_Step_Plot(steps, 4400, 4420, 2)
+    Print_Step_Plot(steps, 350, 3000, 50)
 

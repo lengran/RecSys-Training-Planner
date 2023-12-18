@@ -130,6 +130,14 @@ class CacheManager(torch.nn.Module):
         )
         self._finished_batch = -1
         # self._num_binded_embedding_bag = 0
+
+        # cache_row_idx -> frequency, freq of the cache rows.
+        # classic lfu cache. evict the minimal freq value row in cuda cache.
+        self.register_buffer(
+            "freq_cnter",
+            torch.empty(self.cuda_row_num, device=torch.cuda.current_device(), dtype=torch.long).fill_(sys.maxsize),
+            persistent=False,
+        )
     
     def _init_weight(self, weight: torch.Tensor) -> None:
         if self.cuda_row_num > 0:
@@ -238,6 +246,9 @@ class CacheManager(torch.nn.Module):
                 unique_gpu_row_idxs = self.inverted_cached_idx[cpu_row_idxs]
                 self.batch_flags.index_fill_(0, unique_gpu_row_idxs, batch_pointer)
 
+                # Update LFU flag
+                self.freq_cnter.scatter_add_(0, unique_gpu_row_idxs, repeat_times)
+
         return gpu_row_idxs
 
     @torch.no_grad()
@@ -247,7 +258,6 @@ class CacheManager(torch.nn.Module):
             cpu_row_idxs (torch.Tensor): the rows to be placed on CUDA
         """
         evict_num = cpu_row_idxs.numel() - self.cuda_available_row_num
-
         cpu_row_idxs_copy = cpu_row_idxs.cpu()
 
         # move evict in rows to gpu
@@ -263,11 +273,11 @@ class CacheManager(torch.nn.Module):
         # print("[Prepare id]: finished " + str(self._finished_batch) + ", max batch stamp in cache" + str(torch.max(self.batch_flags)) + ", evict_num " + str(evict_num))
         if evict_num > 0:
             with self.timer("2_identify_cuda_row_idxs") as timer:
-                mask_cpu_row_idx = torch.isin(self.cached_idx_map, self.evict_backlist)
-                invalid_idxs = torch.nonzero(mask_cpu_row_idx).squeeze(1)
+                masked_gpu_rows = torch.isin(self.cached_idx_map, self.evict_backlist)
+                idx_masked_gpu_rows = torch.nonzero(masked_gpu_rows).squeeze(1)
                 
                 with self.timer("2_1_update_batch_flags_of_existing_gpu_row") as timer:
-                    self.batch_flags.index_fill_(0, invalid_idxs, batch_pointer)
+                    self.batch_flags.index_fill_(0, idx_masked_gpu_rows, batch_pointer)
                 
                 # Batch flag based evict strategy
                 with self.timer("2_2_find_evict_gpu_idxs") as timer:
@@ -310,7 +320,8 @@ class CacheManager(torch.nn.Module):
 
                 self.cached_idx_map.index_fill_(0, evict_gpu_row_idxs, -1)
                 self.inverted_cached_idx.index_fill_(0, evict_info, -1)
-                # self.freq_cnter.index_fill(0, evict_gpu_row_idxs, sys.maxsize) # unnecessary
+                self.freq_cnter.index_fill(0, evict_gpu_row_idxs, sys.maxsize) # unnecessary
+                self.batch_flags.index_fill_(0, evict_gpu_row_idxs, -1) # unnecessary
                 self._cuda_available_row_num += evict_num
 
                 weight_size = evict_gpu_row_idxs.numel() * self.embedding_dim
@@ -319,7 +330,7 @@ class CacheManager(torch.nn.Module):
 
         # slots of cuda weight to evict in
         with self.timer("4_identify_cuda_slot") as timer:
-            slots = torch.nonzero(self.cached_idx_map == -1).squeeze(1)[: cpu_row_idxs.numel()]
+            slots = torch.nonzero(self.cached_idx_map == -1).squeeze(1)[: cpu_row_idxs.numel()]     # index of gpu rows
 
         # TODO wait for optimize
         with self.timer("5_evict_in") as timer:
@@ -351,8 +362,9 @@ class CacheManager(torch.nn.Module):
                         self.cuda_cached_weight.view(self.cuda_row_num, -1).index_copy_(0, slots, evict_in_rows_gpu)
 
         with self.timer("6_update_cache") as timer:
-            self.cached_idx_map[slots] = cpu_row_idxs
+            self.cached_idx_map.index_copy_(0, slots, cpu_row_idxs)
             self.inverted_cached_idx.index_copy_(0, cpu_row_idxs, slots)
+            self.freq_cnter.index_fill_(0, slots, 0)
             self._cuda_available_row_num -= cpu_row_idxs.numel()
             # Don't need to update batch flags because this method only cares the transfered rows. Do it in prepare_id method instead.
 
@@ -364,6 +376,7 @@ class CacheManager(torch.nn.Module):
     def _find_evict_gpu_idxs(self, evict_num: int) -> torch.Tensor:
         """_find_evict_gpu_idxs
         Find the gpu idxs to be evicted, according to their batch flags and current self._finished_batch flag.
+        Choose the top evict_num indices that have the least access frequency.
         Args:
             evict_num (int): how many rows has to be evicted
         Returns:
@@ -372,18 +385,21 @@ class CacheManager(torch.nn.Module):
         # victim_gpu_rows = torch.nonzero(self.batch_flags <= self._finished_batch).squeeze(1)[ : evict_num]
         found_enough_rows = False
         while not found_enough_rows:
-            # First find idx of used rows. Leave unused rows alone.
+            # First find idx of used rows. Leave unused rows alone. Condition 1
             idx_used_gpu_rows = torch.nonzero(self.cached_idx_map != -1).squeeze(1)
-            # Find idx of idx_used_gpu_rows of which the row's batch_flag is smaller than self._finished_batch.
+            # Find idx of idx_used_gpu_rows of which the row's batch_flag is smaller than self._finished_batch. These rows are evictable. Condition 2
+            # idx_idx_used_gpu_rows = torch.nonzero(self.batch_flags[self.cached_idx_map != -1] <= self._finished_batch).squeeze(1)
             idx_idx_used_gpu_rows = torch.nonzero(self.batch_flags[idx_used_gpu_rows] <= self._finished_batch).squeeze(1)
             
-            # if we have found enough slot
+            # if we haven't found enough slot, throw an exception.
             if idx_idx_used_gpu_rows.numel() <=  evict_num:
                 print("[Finding evict idx]: finished " + str(self._finished_batch) + ", max batch stamp in cache" + str(torch.max(self.batch_flags)) + ", num found victims " + str(idx_idx_used_gpu_rows.numel()) + ", evict_num: " + str(evict_num))
-                # import pdb; pdb.set_trace()
                 raise ValueError("No enough rows in gpu cache. Finished batch_flag " + str(self._finished_batch) + ", max batch stamp in cache" + str(torch.max(self.batch_flags)) + ", num found victims " + str(idx_idx_used_gpu_rows.numel()) + ", evict_num: " + str(evict_num))
             else:
-                victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[ : evict_num]]
+                idx_candidate_victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows]
+                # victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[ : evict_num]]
+                _, victim_idx_idx_idx_gpu_rows = torch.topk(self.freq_cnter[idx_candidate_victim_gpu_rows], evict_num, largest=False)
+                victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[victim_idx_idx_idx_gpu_rows]]
                 found_enough_rows = True
 
         return victim_gpu_rows

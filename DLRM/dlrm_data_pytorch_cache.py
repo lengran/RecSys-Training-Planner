@@ -173,7 +173,7 @@ class Data_Manager(object):
                 total_embedding_row = total_embedding_row + num_embedding_list[i]
 
             embedding_dim = args.arch_sparse_feature_size
-            self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True, async_copy=True, buffer_size=0)
+            self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)#, async_copy=True, buffer_size=0)
 
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.

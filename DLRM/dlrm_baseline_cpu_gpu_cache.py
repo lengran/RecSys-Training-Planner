@@ -98,8 +98,7 @@ import sklearn.metrics
 from torch.optim.lr_scheduler import _LRScheduler
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
-# os.environ["CUDA_LAUNCH_BLOCKING"]="1"
+os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 

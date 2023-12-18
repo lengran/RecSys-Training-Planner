@@ -143,10 +143,10 @@ class DataManager():
             self.offsets.append(num_embedding_rows)
             num_embedding_rows = num_embedding_rows + self.num_cat_counts[i]
         embedding_dim = args.arch_sparse_feature_size
-        self.gpu_cache = CacheManager(num_embeddings=num_embedding_rows, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)
+        self.gpu_cache = CacheManager(num_embeddings=num_embedding_rows, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)#, async_copy=True, buffer_size=0)
 
         # Create a special sampler to support import and export of training plans. TODO: make this switchable from outside this script, elegantly.
-        # custom_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
+        # custom_train_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
         custom_train_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=True, drop_last=False, dataset=self.train_data)
 
         val_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=15000, shuffle=True, drop_last=False, dataset=self.val_data)
