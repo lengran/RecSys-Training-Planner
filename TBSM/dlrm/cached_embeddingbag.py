@@ -398,7 +398,8 @@ class CacheManager(torch.nn.Module):
             else:
                 idx_candidate_victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows]
                 # victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[ : evict_num]]
-                _, victim_idx_idx_idx_gpu_rows = torch.topk(self.freq_cnter[idx_candidate_victim_gpu_rows], evict_num, largest=False)
+                _, victim_idx_idx_idx_gpu_rows = torch.topk(self.freq_cnter[idx_candidate_victim_gpu_rows], evict_num, largest=False)           # expensive, temporarily disabled to align it with planner
+                # victim_idx_idx_idx_gpu_rows = torch.tensor(list(range(evict_num)), dtype=torch.long)                                               # a cheap equivalent. Replace this with algorithm used in planner later.
                 victim_gpu_rows = idx_used_gpu_rows[idx_idx_used_gpu_rows[victim_idx_idx_idx_gpu_rows]]
                 found_enough_rows = True
 

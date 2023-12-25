@@ -9,11 +9,16 @@ from math import ceil
 import statistics
 import time
 from multiprocessing import Process, Queue, get_context
+import heapq
 
 LARGE_NUMBER = 10000000
-
-DLRM_GPU_CACHE_SIZE = int(33762577 * 0.05 * 3)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
-TBSM_GPU_CACHE_SIZE = int(5159457 * 0.05 * 3)                                                       # num of rows * cache_ratio
+CACHE_RATIO = 0.20
+DATASET = "taobao"
+BATCH_FILE_SUFFIX = "-16384"
+LOG_PATH = "/root/files/coding/data_loading_planner/taobao_run_3"
+PLAN_FILE_NAME = "-LFU-20-16384-2"
+DLRM_GPU_CACHE_SIZE = int(33762577 * CACHE_RATIO)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
+TBSM_GPU_CACHE_SIZE = int(5159457 * CACHE_RATIO)                                                        # num of rows * cache_ratio
 DLRM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
 TBSM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/TBSM/output/taobao_train_t20.npz"
 DLRM_PLAN_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/training_plan/"
@@ -38,6 +43,7 @@ class Planner(object):
             hotness_diff_threshold_late_time_cap: float = 1,
             hotness_diff_threshold_startup_cap: int = 0,
             hotness_diff_threshold_recal_steps: int = 0,
+            batch_file: str = None
             ) -> None:
         '''
         args:
@@ -58,9 +64,11 @@ class Planner(object):
             hotness_diff_threshold_recal_steps (int): After searching such many steps, recalibrate the threshold.
         '''
         # Read the batches.
+        if batch_file is None:
+            batch_file = ""
         loading_begin = time.time()
-        print("Loading data...")
-        batches = df.read_parquet(os.path.join(os.path.abspath(plan_path), "batches.parquet")).transpose()             # each column is a batch of indices of dataset's row
+        print("Loading dataset " + dataset + "...")
+        batches = df.read_parquet(os.path.join(os.path.abspath(plan_path), "batches" + batch_file + ".parquet")).transpose()             # each column is a batch of indices of dataset's row
         self.batch_num = batches.shape[1]
         self.batch_size = batches.shape[0]
 
@@ -241,7 +249,11 @@ class Planner(object):
             # Evic first num_rows_to_evic rows of ids, since the gpu_cache is sorted by batch flags.
             if num_rows_to_evic > 0:
                 evictable_row = gpu_cache[gpu_cache.isin(batch_ids) == False]
-                idx_freq_evictable_row = freq_register[evictable_row.index].nlargest(num_rows_to_evic, keep='last').index
+                nonempty_row = gpu_cache[evictable_row.index][gpu_cache[evictable_row.index] != -1]
+                idx_freq_evictable_row = freq_register[nonempty_row.index].nsmallest(num_rows_to_evic, keep='last').index       # very expensive
+                # idx_freq_evictable_row = evictable_row.index[:num_rows_to_evic]                                                 # a cheap equivalent, TODO: implement a O(nlogn) algorithm later
+                if idx_freq_evictable_row.shape[0] < num_rows_to_evic:                                                                      # Temporarily fix. should replace this and the expensive line of code with a O(nlogn). Do this after the paper being submitted.
+                    idx_freq_evictable_row = nonempty_row.index[:num_rows_to_evic]
                 gpu_cache[idx_freq_evictable_row] = -1
                 freq_register[idx_freq_evictable_row] = 0
                 # gpu_cache = gpu_cache.iloc[num_rows_to_evic : -1]
@@ -296,7 +308,7 @@ class Planner(object):
         hotness_diff_threshold_ratio_increment = 0
 
         output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / self.cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
-        print(output_str)
+        # print(output_str)
         self.search_log.write(output_str + "\n")
 
         # Searching
@@ -309,7 +321,10 @@ class Planner(object):
             if (cache_state == -1).nunique() == 2:
                 num_available_rows = int(cache_state.value_counts()[-1]) # self.cached_rows - len(cache_state)
             else:
-                num_available_rows = 0
+                if (cache_state == -1)[0]:
+                    num_available_rows = self.cached_rows
+                else:
+                    num_available_rows = 0
 
             # Recalibration
             if step % self.hotness_diff_threshold_recal_steps == 0:
@@ -365,15 +380,23 @@ class Planner(object):
 
             # Update cache
             batch_ids = self.batches[choice]
-            freq_batch_ids = self.freq_batches[plan[step]]
+            freq_batch_ids = self.freq_batches[choice]
             ids_to_comm = batch_ids[batch_ids.isin(cache_state) == False]
             num_ids_to_comm = len(ids_to_comm)
+            if num_ids_to_comm > self.cached_rows:
+                print("Even batch with the smallest cost exceeds the capacity of the cache.")
+                import pdb; pdb.set_trace()
             freq_ids_to_comm = freq_batch_ids[ids_to_comm.index]
-            num_rows_to_evic = len(ids_to_comm) - num_available_rows
+            num_rows_to_evic = num_ids_to_comm - num_available_rows
             if num_rows_to_evic > 0:
                 # cache_state = cache_state.iloc[num_rows_to_evic : -1]
                 evictable_row = cache_state[cache_state.isin(batch_ids) == False]
-                idx_freq_evictable_row = freq_state[evictable_row.index].nlargest(num_rows_to_evic, keep='last').index
+                nonempty_row = cache_state[evictable_row.index][cache_state[evictable_row.index] != -1]
+                # idx_freq_evictable_row = freq_state[evictable_row.index].nsmallest(len(evictable_row) - num_rows_to_evic, keep='last', ).index                      # Very expensive!!!
+                idx_freq_evictable_row = freq_state[nonempty_row.index].nsmallest(num_rows_to_evic, keep='last', ).index                      # Very expensive!!!
+                # idx_freq_evictable_row = evictable_row.index[:num_rows_to_evic]                                                                 # a cheap equivalent
+                if idx_freq_evictable_row.shape[0] < num_rows_to_evic:                                                                      # Temporarily fix. should replace this and the expensive line of code with a O(nlogn). Do this after the paper being submitted.
+                    idx_freq_evictable_row = nonempty_row.index[:num_rows_to_evic]
                 cache_state[idx_freq_evictable_row] = -1
                 freq_state[idx_freq_evictable_row] = 0
             # cache_state = df.concat([cache_state, ids_to_comm], ignore_index=True)
@@ -606,6 +629,7 @@ class Planner(object):
 
         # Save environment (protect the scene)
         backup_batches = self.batches[:]
+        backup_freq_batches = self.freq_batches[:]
         backup_num_batches = self.batch_num
         backup_warm_up_steps = self.warm_up_steps
         
@@ -623,6 +647,7 @@ class Planner(object):
         self.batch_num = chunk_size
         self.plan = None
         self.batches = list()
+        self.freq_batches = list()
         batch_indices = list()
         
         if init_plan is not None:
@@ -640,6 +665,7 @@ class Planner(object):
             idx = idx_unused_batches.pop(0)
             batch_indices.append(idx)
             self.batches.append(backup_batches[idx])
+            self.freq_batches.append(backup_freq_batches[idx])
         
         # Issue the first searching process
         queues.append(ctx.Queue())
@@ -657,17 +683,19 @@ class Planner(object):
             self.plan = None
             self.batches = list()
             batch_indices = list()
+            self.freq_batches = list()
 
             for i in range(chunk_size):
                 idx = idx_unused_batches.pop(0)
                 batch_indices.append(idx)
                 self.batches.append(backup_batches[idx])
+                self.freq_batches.append(backup_freq_batches[idx])
             
             queues.append(ctx.Queue())
             list_batch_indices.append(batch_indices)
             processes.append(ctx.Process(target=self.Search_Wrapper, args=(queues[chunk_count], chunk_count, )))
             processes[chunk_count].start()
-            
+
             print("[Chunk " + str(chunk_count) + "] Issued.")
             chunk_count = chunk_count + 1
         
@@ -678,9 +706,11 @@ class Planner(object):
         self.plan = None
         batch_indices = idx_unused_batches[:]
         self.batches = list()
+        self.freq_batches = list()
 
         for i in range(len(idx_unused_batches)):
             self.batches.append(backup_batches[idx_unused_batches[i]])
+            self.freq_batches.append(backup_freq_batches[idx_unused_batches[i]])
         
         last_cost, _, _= self.Heuristic_Search(process_id=chunk_count)
         
@@ -709,6 +739,7 @@ class Planner(object):
         
         # Restore environment
         self.batches = backup_batches[:]
+        self.freq_batches = backup_freq_batches[:]
         self.batch_num = backup_num_batches
         self.warm_up_steps = backup_warm_up_steps
         self.plan = plan
@@ -732,6 +763,646 @@ class Planner(object):
             mark = ""
         df.DataFrame({'plan': self.plan}).to_parquet(os.path.join(self.plan_path, ("training_plan" + mark +".parquet")))
 
+def nlargest(data: np.ndarray, n: int, reverse: bool = False) -> np.ndarray:
+    if reverse:
+        n = data.shape[0] - n
+    
+    if len(data) < n:
+        print("len(data) < n: len(data) = " + str(len(data)) + ", n = " + str(n))
+        import pdb; pdb.set_trace()
+    if len(data) == n:
+        if not reverse:
+            return np.arange(len(data), dtype=np.int32)
+        else:
+            return np.array([], dtype=np.int32)
+
+    result = np.zeros(n, dtype=np.int32)
+
+    # Deal with 0 first
+    idx_nonzero = np.flatnonzero(data)
+    num_nonzero = idx_nonzero.shape[0]
+    if num_nonzero < n:
+        idx_zero = np.flatnonzero(data == 0)
+        
+        result[:num_nonzero] = idx_nonzero
+        result[num_nonzero:n] = idx_zero[n - num_nonzero]
+
+        if not reverse:
+            return result
+        else:
+            tmp = np.ones(data.shape[0], dtype=np.bool8)
+            tmp[result] = False
+            return np.flatnonzero(tmp)
+
+    if num_nonzero == n:
+        if not reverse:
+            return idx_nonzero
+        else:
+            tmp = np.ones(data.shape[0], dtype=np.bool8)
+            tmp[idx_nonzero] = False
+            return np.flatnonzero(tmp)
+
+    # Search from nonzero data
+    rng = np.random.default_rng()
+
+    rest_n = n
+    rest_data = data
+    rest_idx = np.arange(len(data), dtype=np.int32)
+
+    while True:
+        pivot_idx = rng.integers(0, len(rest_data))
+        pivot = rest_data[pivot_idx]
+        idx_larger_group = np.flatnonzero(rest_data >= pivot)
+        idx_smaller_group = np.flatnonzero(rest_data < pivot)
+        if len(idx_larger_group) < rest_n:
+            result[n - rest_n:n - rest_n + len(idx_larger_group)] = rest_idx[idx_larger_group]
+            
+            rest_n -= len(idx_larger_group)
+            rest_data = rest_data[idx_smaller_group]
+            rest_idx = rest_idx[idx_smaller_group]
+        elif len(idx_larger_group) > rest_n:
+            rest_data = rest_data[idx_larger_group]
+            rest_idx = rest_idx[idx_larger_group]
+        else:
+            result[n - rest_n:n - rest_n + len(idx_larger_group)] = rest_idx[idx_larger_group]
+            break
+    
+    if not reverse:
+        return result
+    else:
+        tmp = np.ones(data.shape[0], dtype=np.bool8)
+        tmp[result] = False
+        return np.flatnonzero(tmp)
+
+def New_Simulate_Cost(plan: list, cached_rows: int, batches_id: list, batches_freq: list, init_cache_state: np.ndarray = None, start_step: int = 0, start_cost: int = 0, process_id: int = None, should_print: bool = False):
+    '''
+    Calculate cost of a given route.
+    '''
+    num_batches = len(batches_id)
+
+    if process_id is not None:
+        process_info = "[Process " + str(process_id) + "] "
+    else:
+        process_info = ""
+
+    num_steps = len(plan)
+    if isinstance(init_cache_state, np.ndarray):
+        gpu_cache = init_cache_state
+        cost_total = start_cost
+        num_available_rows = cached_rows - len(gpu_cache)
+    else:
+        gpu_cache = np.array([-1] * cached_rows, dtype=np.int32)
+        cost_total = 0
+        start_step = 0
+        num_available_rows = cached_rows
+    
+    freq_register = np.array([-1] * cached_rows, dtype=np.int32)
+    
+    # the main loop
+    for step in range(start_step, num_steps):
+        # Print progress
+        if should_print and ((step - start_step) % (int((num_steps - start_step) / 10) + 1)) == 0:
+            print(process_info + str(int((step - start_step) / ((num_steps - start_step) / 10))) + "0%")
+        
+        # Get ids in current batch
+        batch_id = batches_id[plan[step]]
+        batch_freq = batches_freq[plan[step]]
+
+        # Find ids that need to be transfered to cache
+        mask_ids_to_comm = np.isin(batch_id, gpu_cache, assume_unique=True, invert=True)
+        ids_to_comm = batch_id[mask_ids_to_comm]
+        freq_ids_to_comm = batch_freq[mask_ids_to_comm]
+        num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+        num_rows_to_evic = num_ids_to_comm - num_available_rows
+        num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+
+        # Evic first num_rows_to_evic rows of ids, since the gpu_cache is sorted by batch flags.
+        if num_rows_to_evic > 0:
+            mask_evictable_row = np.isin(gpu_cache, batch_id, assume_unique=True, invert=True)
+            idx_nonempty_row = np.flatnonzero(mask_evictable_row)[gpu_cache[mask_evictable_row] != -1]
+            idx_idx_freq_evictable_row = nlargest(freq_register[idx_nonempty_row], num_rows_to_evic, reverse=True)
+            idx_freq_evictable_row = idx_nonempty_row[idx_idx_freq_evictable_row]
+            gpu_cache[idx_freq_evictable_row] = -1
+            freq_register[idx_freq_evictable_row] = 0
+        
+        # Update gpu cache
+        idx_update = np.flatnonzero(gpu_cache == -1)[:num_ids_to_comm]
+        gpu_cache[idx_update] = ids_to_comm
+        freq_register[idx_update] += freq_ids_to_comm
+        
+        num_available_rows = num_available_rows + num_rows_to_evic - num_ids_to_comm
+        cost_total = cost_total + num_ids_to_comm + num_rows_to_evic
+
+    return cost_total, gpu_cache, freq_register
+
+def New_Heuristic_Search(
+        log_path: str, 
+        cached_rows: int, 
+        batches_id: list, 
+        batches_freq: list, 
+        warm_up_steps:int = 0, 
+        init_plan: list = None, 
+        init_cache_state: np.ndarray = None, 
+        init_cost: int = None, 
+        process_id: int = None, 
+        init_freq_status: np.ndarray  = None, 
+        search_limit: int = 2000,
+        hotness_diff_threshold_base_relax_ratio: float = 0.8,
+        hotness_diff_threshold_update_window: int = 10,
+        hotness_diff_threshold_startup_cap: int = 10,
+        hotness_diff_threshold_increment_relax_ratio: float = 0.001,
+        hotness_diff_threshold_late_time_cap: float = 1,
+        hotness_diff_threshold_relax_ratio_penalty_rate: float = 0.8,
+        ) -> tuple:
+    num_batches = len(batches_id)
+    
+    if process_id is not None:
+        process_info = "[Process " + str(process_id) + "] "
+        log_file_suffix = "-" + str(process_id)
+    else:
+        process_info = ""
+        log_file_suffix = ""
+    log_file_path = os.path.join(log_path, ("search-log" + log_file_suffix + ".txt"))
+    search_log = open(log_file_path, "w")
+    # search_log_l2 = open(os.path.join(log_path, "search-log-level-2" + log_file_suffix + ".txt"), "w")
+
+    if isinstance(init_plan, list):
+        plan = init_plan
+    else:
+        plan = list()
+    
+    unused_batch = [i for i in range(num_batches) if i not in plan]
+    random.shuffle(unused_batch)
+
+    # The warm up phase (randomly fill in some steps since the first few steps don't really matter that much.)
+    time_warmup_start = time.time()
+    if len(plan) < warm_up_steps:
+        fill_in_length = warm_up_steps - len(plan)
+        plan = plan + unused_batch[ : fill_in_length]
+        del unused_batch[ : fill_in_length]
+    if init_cache_state is not None and init_cost is not None and init_freq_status is not None:
+        cost_total = init_cost
+        cache_state = init_cache_state
+        freq_state = init_freq_status
+    else:
+        cost_total, cache_state, freq_state = New_Simulate_Cost(plan, cached_rows, batches_id, batches_freq)
+    
+    time_warmup_finished = time.time()
+
+    # Set up the hotness difference threshold.
+    hotness_diff_threshold = LARGE_NUMBER
+    hotness_diff_history = [hotness_diff_threshold] * hotness_diff_threshold_update_window
+    hotness_diff_history_idx = 0
+    hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio
+    hotness_diff_threshold_ratio_increment = 0
+
+    # output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    # Searching
+    time_last_step = time.time()
+    start_step = len(plan)
+    for step in range(start_step, num_batches):
+        # Print progress
+        if ((step - start_step) % (int((num_batches - start_step) / 100) + 1)) == 0:
+            print(process_info + str(int((step - start_step) / ((num_batches - start_step) / 100))) + "%")
+        
+        cost_best_choice = LARGE_NUMBER
+        # cache_state_best_choice = None
+        best_choice = 0
+        cost_worst_choice = 0
+        num_available_rows = np.count_nonzero(cache_state == -1)
+
+        # Search at most self.search_limit steps to find a choice
+        for choice_idx in range(len(unused_batch)):
+            # Just calculate cost, don't update cache.
+            batch_id = batches_id[unused_batch[choice_idx]]
+            mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+            ids_to_comm = batch_id[mask_ids_to_comm]
+            num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+            num_rows_to_evic = num_ids_to_comm - num_available_rows
+            num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+            cost_tmp = num_ids_to_comm + num_rows_to_evic
+            
+            # Record a better/worse choice
+            if cost_tmp < cost_best_choice:
+                cost_best_choice = cost_tmp
+                best_choice = choice_idx
+            if cost_tmp > cost_worst_choice:
+                cost_worst_choice = cost_tmp
+            
+            # Early stop conditions
+            hotness_diff_tmp = cost_worst_choice - cost_best_choice
+            if choice_idx > hotness_diff_threshold_startup_cap and hotness_diff_tmp > hotness_diff_threshold:
+                hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment + hotness_diff_threshold_increment_relax_ratio
+                hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+                break
+
+            # Late stop conditions
+            if choice_idx > search_limit or choice_idx == (len(unused_batch) - 1):
+                break
+
+            # Level 2 logging
+            # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
+            # search_log_l2.write(output_str + "\n")
+        
+        # Decide current step and actually update cache state.
+        choice = unused_batch.pop(best_choice)
+        plan.append(choice)
+        # cache_state = cache_state_best_choice
+        cost_total = cost_total + cost_best_choice
+        random.shuffle(unused_batch)
+
+        # Update cache
+        batch_id = batches_id[choice]
+        batch_freq = batches_freq[choice]
+
+        mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+        ids_to_comm = batch_id[mask_ids_to_comm]
+        num_ids_to_comm = len(ids_to_comm)
+        if num_ids_to_comm > cached_rows:
+            print("Even batch with the smallest cost exceeds the capacity of the cache.")
+            import pdb; pdb.set_trace()
+        freq_ids_to_comm = batch_freq[mask_ids_to_comm]
+        num_rows_to_evic = num_ids_to_comm - num_available_rows
+
+        if num_rows_to_evic > 0:
+            mask_evictable_row = np.isin(cache_state, batch_id, assume_unique=True, invert=True)
+            idx_nonempty_row = np.flatnonzero(mask_evictable_row)[cache_state[mask_evictable_row] != -1]
+            idx_idx_freq_evictable_row = nlargest(freq_state[idx_nonempty_row], num_rows_to_evic, reverse=True)
+            idx_freq_evictable_row = idx_nonempty_row[idx_idx_freq_evictable_row]
+            # idx_freq_evictable_row = nlargest(freq_state[mask_evictable_row], num_rows_to_evic)                      # Very expensive!!!
+            cache_state[idx_freq_evictable_row] = -1
+            freq_state[idx_freq_evictable_row] = 0
+
+        idx_update = np.flatnonzero(cache_state == -1)[:num_ids_to_comm]
+        cache_state[idx_update] = ids_to_comm
+        freq_state[idx_update] += freq_ids_to_comm
+
+        # Update threshold
+        hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
+        hotness_diff_history_idx = (hotness_diff_history_idx + 1) % hotness_diff_threshold_update_window
+        hotness_diff_mean = np.mean(hotness_diff_history)
+        hotness_diff_threshold = hotness_diff_mean * hotness_diff_threshold_dynamic_ratio
+
+        # Any step takes more than 0.3s should be considered as slightly late, thus no increment of ralax ratio
+        step_time = time.time() - time_last_step
+        time_last_step = time.time()
+        if step_time > hotness_diff_threshold_late_time_cap:
+            hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment * hotness_diff_threshold_relax_ratio_penalty_rate
+            hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+
+        # Logging
+        
+        output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage(last run): " + str(1 - (num_available_rows/ cached_rows)) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+        # print(output_str)
+        search_log.write(output_str + "\n")
+    
+    # output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    search_log.close()
+    # search_log_l2.close()
+
+    return plan, cost_total, cache_state, freq_state
+
+def Wrapper_Cost(q: Queue, process_id: int, should_print:bool, plan: list, cached_rows: int, batches_id: list, batches_freq: list):
+    cost, _, _ = New_Simulate_Cost(plan, cached_rows, batches_id, batches_freq, process_id=process_id, should_print=should_print)
+    q.put(cost)
+
+def Wrapper_Search(
+        q: Queue,
+        log_path: str, 
+        cached_rows: int, 
+        batches_id: list, 
+        batches_freq: list, 
+        process_id: int,  
+        search_limit: int,
+        hotness_diff_threshold_base_relax_ratio: float,
+        hotness_diff_threshold_update_window: int,
+        hotness_diff_threshold_relax_ratio_penalty_rate: float,
+        hotness_diff_threshold_increment_relax_ratio: float,
+        hotness_diff_threshold_late_time_cap: float,
+        hotness_diff_threshold_startup_cap: int,
+        ):
+    plan, cost, _, _ = New_Heuristic_Search(
+        log_path=log_path, 
+        cached_rows=cached_rows, 
+        batches_id=batches_id, 
+        batches_freq=batches_freq, 
+        warm_up_steps=0, 
+        init_plan=None,
+        init_cache_state=None,
+        init_cost=None,
+        process_id=process_id,
+        init_freq_status=None,
+        search_limit=search_limit, 
+        hotness_diff_threshold_base_relax_ratio=hotness_diff_threshold_base_relax_ratio, 
+        hotness_diff_threshold_update_window=hotness_diff_threshold_update_window,
+        hotness_diff_threshold_relax_ratio_penalty_rate=hotness_diff_threshold_relax_ratio_penalty_rate,
+        hotness_diff_threshold_increment_relax_ratio=hotness_diff_threshold_increment_relax_ratio,
+        hotness_diff_threshold_late_time_cap=hotness_diff_threshold_late_time_cap,
+        hotness_diff_threshold_startup_cap=hotness_diff_threshold_startup_cap,
+        )
+    q.put(cost)
+    q.put(plan)
+
+def New_Multiprocess_Search( 
+        chunk_size: int, 
+        log_path: str, 
+        cached_rows: int, 
+        batches_id: list, 
+        batches_freq: list, 
+        search_limit: int = 2000,
+        hotness_diff_threshold_base_relax_ratio: float = 0.8,
+        hotness_diff_threshold_update_window: int = 10,
+        hotness_diff_threshold_relax_ratio_penalty_rate: float = 0.8,
+        hotness_diff_threshold_increment_relax_ratio: float = 0.001,
+        hotness_diff_threshold_late_time_cap: float = 1,
+        hotness_diff_threshold_startup_cap: int = 10,
+        ):
+    # Check chunk_size and make sure it is reasonable
+    batch_num = len(batches_id)
+    assert batch_num > chunk_size
+
+    # Initialization. Do the first loop to handle num_warm_up_steps and init_plan.
+    idx_unused_batches = list(range(batch_num))     # TODO: shuffle
+    plan = list()
+    processes = list()
+    queues = list()
+    list_batch_indices = list()
+        
+    chunk_count = 0
+
+    # Segment unused batches (create new scene) and search
+    while len(idx_unused_batches) > chunk_size:
+        sub_batch_num = chunk_size
+        sub_batches_id = list()
+        sub_batches_freq = list()
+        sub_batch_indices = list()
+
+        for i in range(sub_batch_num):
+            idx = idx_unused_batches.pop(0)
+            sub_batch_indices.append(idx)
+            sub_batches_id.append(batches_id[idx])
+            sub_batches_freq.append(batches_freq[idx])
+            
+        queues.append(Queue())
+        list_batch_indices.append(sub_batch_indices)
+        processes.append(Process(target=Wrapper_Search, args=(
+            queues[chunk_count], 
+            log_path, 
+            cached_rows, 
+            sub_batches_id,
+            sub_batches_freq,
+            chunk_count,
+            search_limit,
+            hotness_diff_threshold_base_relax_ratio,
+            hotness_diff_threshold_update_window,
+            hotness_diff_threshold_relax_ratio_penalty_rate,
+            hotness_diff_threshold_increment_relax_ratio,
+            hotness_diff_threshold_late_time_cap,
+            hotness_diff_threshold_startup_cap,
+        )))
+        processes[chunk_count].start()
+
+        print("[Chunk " + str(chunk_count) + "] Issued.")
+        chunk_count = chunk_count + 1
+        
+    # Last chunk: len(unused_batches) <= chunk_size
+    start_time = time.time()
+
+    sub_batch_num = len(idx_unused_batches)
+    sub_batches_id = list()
+    sub_batches_freq = list()
+    sub_batch_indices = idx_unused_batches[:]
+
+    for i in range(sub_batch_num):
+        sub_batches_id.append(batches_id[i])
+        sub_batches_freq.append(batches_freq[i])
+        
+    last_plan, last_cost, _, _ = New_Heuristic_Search(
+        log_path, 
+        cached_rows, 
+        sub_batches_id, 
+        sub_batches_freq, 
+        warm_up_steps=0, 
+        init_plan=None,
+        init_cache_state=None,
+        init_cost=None,
+        process_id=chunk_count,
+        init_freq_status=None,
+        search_limit=search_limit, 
+        hotness_diff_threshold_base_relax_ratio=hotness_diff_threshold_base_relax_ratio, 
+        hotness_diff_threshold_update_window=hotness_diff_threshold_update_window,
+        hotness_diff_threshold_relax_ratio_penalty_rate=hotness_diff_threshold_relax_ratio_penalty_rate,
+        hotness_diff_threshold_increment_relax_ratio=hotness_diff_threshold_increment_relax_ratio,
+        hotness_diff_threshold_late_time_cap=hotness_diff_threshold_late_time_cap,
+        hotness_diff_threshold_startup_cap=hotness_diff_threshold_startup_cap,
+        )
+        
+    end_time = time.time()
+    print("[Chunk " + str(chunk_count) + " (the last chunk)] Searched. Cost = " + str(last_cost) + ". (time: " + str(end_time - start_time) + "s)")
+
+    # Collect results
+    cost = 0
+    for i in range(len(processes)):
+        processes[i].join()
+        subcost = queues[i].get()
+        subplan = queues[i].get()
+        chunk_batch_indices = list_batch_indices[i]
+
+        cost = cost + subcost
+        for j in range(chunk_size):
+            plan.append(chunk_batch_indices[subplan[j]])
+            
+        print("[Chunk " + str(i) + "] Collected. Subcost: " + str(subcost) + ", length of plan: " + str(len(subplan)) + ".")
+        
+    cost = cost + last_cost
+    for i in range(sub_batch_num):
+        plan.append(sub_batch_indices[last_plan[i]])
+        
+    print("[Chunk " + str(chunk_count) + "  (the last chunk)] Collected. Subcost: " + str(last_cost) + ", length of plan: " + str(len(last_plan)) + ".")
+
+    return plan, cost
+
+def Count_Heuristic_Search(
+        log_path: str, 
+        cached_rows: int, 
+        batches_id: list, 
+        batches_freq: list, 
+        warm_up_steps:int = 0, 
+        init_plan: list = None, 
+        init_cache_state: np.ndarray = None, 
+        init_cost: int = None, 
+        process_id: int = None, 
+        init_freq_status: np.ndarray  = None, 
+        search_limit: int = 2000,
+        hotness_diff_threshold_base_relax_ratio: float = 0.8,
+        hotness_diff_threshold_update_window: int = 10,
+        hotness_diff_threshold_startup_cap: int = 10,
+        hotness_diff_threshold_increment_relax_ratio: float = 0.001,
+        hotness_diff_threshold_late_time_cap: float = 1,
+        hotness_diff_threshold_relax_ratio_penalty_rate: float = 0.8,
+        ) -> tuple:
+    count_search_step = 0
+    
+    num_batches = len(batches_id)
+    
+    if process_id is not None:
+        process_info = "[Process " + str(process_id) + "] "
+        log_file_suffix = "-" + str(process_id)
+    else:
+        process_info = ""
+        log_file_suffix = ""
+    log_file_path = os.path.join(log_path, ("search-log" + log_file_suffix + ".txt"))
+    search_log = open(log_file_path, "w")
+    # search_log_l2 = open(os.path.join(log_path, "search-log-level-2" + log_file_suffix + ".txt"), "w")
+
+    if isinstance(init_plan, list):
+        plan = init_plan
+    else:
+        plan = list()
+    
+    unused_batch = [i for i in range(num_batches) if i not in plan]
+    random.shuffle(unused_batch)
+
+    # The warm up phase (randomly fill in some steps since the first few steps don't really matter that much.)
+    time_warmup_start = time.time()
+    if len(plan) < warm_up_steps:
+        fill_in_length = warm_up_steps - len(plan)
+        plan = plan + unused_batch[ : fill_in_length]
+        del unused_batch[ : fill_in_length]
+    if init_cache_state is not None and init_cost is not None and init_freq_status is not None:
+        cost_total = init_cost
+        cache_state = init_cache_state
+        freq_state = init_freq_status
+    else:
+        cost_total, cache_state, freq_state = New_Simulate_Cost(plan, cached_rows, batches_id, batches_freq)
+    
+    time_warmup_finished = time.time()
+
+    # Set up the hotness difference threshold.
+    hotness_diff_threshold = LARGE_NUMBER
+    hotness_diff_history = [hotness_diff_threshold] * hotness_diff_threshold_update_window
+    hotness_diff_history_idx = 0
+    hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio
+    hotness_diff_threshold_ratio_increment = 0
+
+    # output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    # Searching
+    time_last_step = time.time()
+    start_step = len(plan)
+    for step in range(start_step, num_batches):
+        # Print progress
+        if ((step - start_step) % (int((num_batches - start_step) / 100) + 1)) == 0:
+            print(process_info + str(int((step - start_step) / ((num_batches - start_step) / 100))) + "%")
+        
+        cost_best_choice = LARGE_NUMBER
+        # cache_state_best_choice = None
+        best_choice = 0
+        cost_worst_choice = 0
+        num_available_rows = np.count_nonzero(cache_state == -1)
+
+        # Search at most self.search_limit steps to find a choice
+        for choice_idx in range(len(unused_batch)):
+            # Just calculate cost, don't update cache.
+            batch_id = batches_id[unused_batch[choice_idx]]
+            mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+            ids_to_comm = batch_id[mask_ids_to_comm]
+            num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+            num_rows_to_evic = num_ids_to_comm - num_available_rows
+            num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+            cost_tmp = num_ids_to_comm + num_rows_to_evic
+            
+            # Record a better/worse choice
+            if cost_tmp < cost_best_choice:
+                cost_best_choice = cost_tmp
+                best_choice = choice_idx
+            if cost_tmp > cost_worst_choice:
+                cost_worst_choice = cost_tmp
+            
+            # Early stop conditions
+            hotness_diff_tmp = cost_worst_choice - cost_best_choice
+            if choice_idx > hotness_diff_threshold_startup_cap and hotness_diff_tmp > hotness_diff_threshold:
+                hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment + hotness_diff_threshold_increment_relax_ratio
+                hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+                break
+
+            # Late stop conditions
+            if choice_idx > search_limit or choice_idx == (len(unused_batch) - 1):
+                break
+
+            # Level 2 logging
+            # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
+            # search_log_l2.write(output_str + "\n")
+        
+        # Decide current step and actually update cache state.
+        choice = unused_batch.pop(best_choice)
+        plan.append(choice)
+        # cache_state = cache_state_best_choice
+        cost_total = cost_total + cost_best_choice
+        random.shuffle(unused_batch)
+
+        # Update cache
+        batch_id = batches_id[choice]
+        batch_freq = batches_freq[choice]
+
+        mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+        ids_to_comm = batch_id[mask_ids_to_comm]
+        num_ids_to_comm = len(ids_to_comm)
+        if num_ids_to_comm > cached_rows:
+            print("Even batch with the smallest cost exceeds the capacity of the cache.")
+            import pdb; pdb.set_trace()
+        freq_ids_to_comm = batch_freq[mask_ids_to_comm]
+        num_rows_to_evic = num_ids_to_comm - num_available_rows
+
+        if num_rows_to_evic > 0:
+            mask_evictable_row = np.isin(cache_state, batch_id, assume_unique=True, invert=True)
+            idx_nonempty_row = np.flatnonzero(mask_evictable_row)[cache_state[mask_evictable_row] != -1]
+            idx_idx_freq_evictable_row = nlargest(freq_state[idx_nonempty_row], num_rows_to_evic, reverse=True)
+            idx_freq_evictable_row = idx_nonempty_row[idx_idx_freq_evictable_row]
+            # idx_freq_evictable_row = nlargest(freq_state[mask_evictable_row], num_rows_to_evic)                      # Very expensive!!!
+            cache_state[idx_freq_evictable_row] = -1
+            freq_state[idx_freq_evictable_row] = 0
+
+        idx_update = np.flatnonzero(cache_state == -1)[:num_ids_to_comm]
+        cache_state[idx_update] = ids_to_comm
+        freq_state[idx_update] += freq_ids_to_comm
+
+        # Update threshold
+        hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
+        hotness_diff_history_idx = (hotness_diff_history_idx + 1) % hotness_diff_threshold_update_window
+        hotness_diff_mean = np.mean(hotness_diff_history)
+        hotness_diff_threshold = hotness_diff_mean * hotness_diff_threshold_dynamic_ratio
+
+        # Any step takes more than 0.3s should be considered as slightly late, thus no increment of ralax ratio
+        step_time = time.time() - time_last_step
+        time_last_step = time.time()
+        if step_time > hotness_diff_threshold_late_time_cap:
+            hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment * hotness_diff_threshold_relax_ratio_penalty_rate
+            hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+
+        # Logging
+        count_search_step += choice_idx
+        output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage(last run): " + str(1 - (num_available_rows/ cached_rows)) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+        # print(output_str)
+        search_log.write(output_str + "\n")
+    
+    # output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    search_log.close()
+    # search_log_l2.close()
+
+    return plan, cost_total, count_search_step
+
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -748,42 +1419,44 @@ if __name__ == "__main__":
         hotness_diff_threshold_startup_cap=10,
         hotness_diff_threshold_recal_steps=0,
     '''
-    
-    # planner = Planner(
-    #     dataset="criteo",
-    #     plan_path=DLRM_PLAN_PATH, 
-    #     data_path=DLRM_DATA_PATH, 
-    #     log_path="/root/files/coding/data_loading_planner/kaggle_run_2", 
-    #     cached_rows=DLRM_GPU_CACHE_SIZE, 
-    #     warm_up_steps=150, 
-    #     search_limit=2000, 
-    #     hotness_diff_threshold_base_relax_ratio=0.9, 
-    #     hotness_diff_threshold_relax_ratio_penalty_rate=0.5, 
-    #     hotness_diff_threshold_increment_relax_ratio=0.001, 
-    #     hotness_diff_threshold_late_time_cap=1,
-    #     hotness_diff_threshold_startup_cap=100,
-    #     hotness_diff_threshold_recal_steps=0,
-    #     )
-    
-    planner = Planner(
-        dataset="taobao",
-        plan_path=TBSM_PLAN_PATH, 
-        data_path=TBSM_DATA_PATH, 
-        log_path="/root/files/coding/data_loading_planner/taobao_run_1", 
-        cached_rows=TBSM_GPU_CACHE_SIZE, 
-        warm_up_steps=10, 
-        search_limit=250, 
-        hotness_diff_threshold_base_relax_ratio=0.8, 
-        hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
-        hotness_diff_threshold_increment_relax_ratio=0.001, 
-        hotness_diff_threshold_late_time_cap=1,
-        hotness_diff_threshold_startup_cap=12,
-        hotness_diff_threshold_recal_steps=0,
-        )
+    if DATASET == "criteo":
+        planner = Planner(
+            dataset="criteo",
+            plan_path=DLRM_PLAN_PATH, 
+            data_path=DLRM_DATA_PATH, 
+            log_path=LOG_PATH, 
+            cached_rows=DLRM_GPU_CACHE_SIZE, 
+            warm_up_steps=0, 
+            search_limit=2000, 
+            hotness_diff_threshold_base_relax_ratio=0.8, 
+            hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
+            hotness_diff_threshold_increment_relax_ratio=0.001, 
+            hotness_diff_threshold_late_time_cap=1,
+            hotness_diff_threshold_startup_cap=12,
+            hotness_diff_threshold_recal_steps=0,
+            batch_file=BATCH_FILE_SUFFIX
+            )
+    else:    
+        planner = Planner(
+            dataset="taobao",
+            plan_path=TBSM_PLAN_PATH, 
+            data_path=TBSM_DATA_PATH, 
+            log_path=LOG_PATH, 
+            cached_rows=TBSM_GPU_CACHE_SIZE, 
+            warm_up_steps=0, 
+            search_limit=2000, 
+            hotness_diff_threshold_base_relax_ratio=0.8, 
+            hotness_diff_threshold_relax_ratio_penalty_rate=0.8, 
+            hotness_diff_threshold_increment_relax_ratio=0.001, 
+            hotness_diff_threshold_late_time_cap=1,
+            hotness_diff_threshold_startup_cap=10,
+            hotness_diff_threshold_recal_steps=0,
+            batch_file=BATCH_FILE_SUFFIX,
+            )
     
     dataloading_time = time.time() - start_time
     
-    print("Planner initialized. Dataset loaded. (" + str(dataloading_time) + "s)\nStart planning...")
+    print("Planner initialized. Dataset loaded. (" + str(dataloading_time) + "s)\n[cache ratio = " + str(CACHE_RATIO) + ", batch size = " + str(planner.batch_size) + "] Start planning...")
 
     # baseline route
     # random_route = list(range(len(planner.batches)))
@@ -801,18 +1474,99 @@ if __name__ == "__main__":
 
     # Grouped Search
     # cost = planner.Grouped_Search(10000)
-    # cost, _ = planner.Simulate_Cost(planner.plan, None, None, None)
 
     # Chunked Search
     # cost = planner.Segmented_Search(2000)
-    cost = planner.Multiprocess_Search(3500)
+    # cost = planner.Multiprocess_Search(9600)
+    # cost, _, _ = planner.Simulate_Cost(planner.plan, None, None, None)
+
 
     # Check cost
-    # planner.Read_plan("-8")
-    # cost, _ = planner.Simulate_Cost(planner.plan, None, None, None)
-    # print("number of batches: " + str(len(planner.plan)))
+    # planner.Read_plan("-29")
+    # print("number of batches: " + str(len(planner.plan)) + ", calculating cost......")
+    # cost, _, _ = planner.Simulate_Cost(planner.plan, None, None, None)
+    
+    '''------------------------ new functions ----------------------------'''
+
+    # Convert dataset data from cudf.Series to np.ndarray
+    num_batches = len(planner.batches)
+    batches_id = list()
+    batches_freq = list()
+    for i in range(num_batches):
+        batches_id.append(planner.batches[i].to_numpy())
+        batches_freq.append(planner.freq_batches[i].to_numpy())
+
+    '''------------------------ New cost calculator ------------------------'''
+    # cost, _, _ = New_Simulate_Cost(planner.plan, planner.cached_rows, batches_id, batches_freq)
+    
+    '''------------------------ New planner ------------------------'''
+    # plan, cost, _, _ = New_Heuristic_Search(
+    #     planner.log_path, 
+    #     planner.cached_rows, 
+    #     batches_id, 
+    #     batches_freq, 
+    #     warm_up_steps=planner.warm_up_steps, 
+    #     search_limit=planner.search_limit, 
+    #     hotness_diff_threshold_base_relax_ratio=planner.hotness_diff_threshold_base_relax_ratio, 
+    #     hotness_diff_threshold_relax_ratio_penalty_rate=planner.hotness_diff_threshold_relax_ratio_penalty_rate,
+    #     hotness_diff_threshold_increment_relax_ratio=planner.hotness_diff_threshold_increment_relax_ratio,
+    #     hotness_diff_threshold_late_time_cap=planner.hotness_diff_threshold_late_time_cap,
+    #     hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
+    #     )
+
+    plan, cost, count_steps = Count_Heuristic_Search(
+        planner.log_path, 
+        planner.cached_rows, 
+        batches_id, 
+        batches_freq, 
+        warm_up_steps=planner.warm_up_steps, 
+        search_limit=planner.search_limit, 
+        hotness_diff_threshold_base_relax_ratio=planner.hotness_diff_threshold_base_relax_ratio, 
+        hotness_diff_threshold_relax_ratio_penalty_rate=planner.hotness_diff_threshold_relax_ratio_penalty_rate,
+        hotness_diff_threshold_increment_relax_ratio=planner.hotness_diff_threshold_increment_relax_ratio,
+        hotness_diff_threshold_late_time_cap=planner.hotness_diff_threshold_late_time_cap,
+        hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
+        )
+    planner.plan = plan[:]
+
+    '''------------------------ New multiprocess planner ------------------------'''
+    # plan, cost = New_Multiprocess_Search(
+    #     1200,
+    #     planner.log_path,
+    #     planner.cached_rows,
+    #     batches_id,
+    #     batches_freq,
+    # )
+    # planner.plan = plan[:]
+    
+
+    '''------------------------ New baseline ------------------------'''
+    # random_route = list(range(len(planner.batches)))
+    # accumulated_cost = 0
+    # num_loop = 10
+    # costs = list()
+    # simulators = list()
+
+    # for i in range(num_loop):
+    #     random.shuffle(random_route)
+    #     costs.append(Queue())
+    #     simulators.append(Process(target=Wrapper_Cost, args=(costs[i], i, True, random_route, planner.cached_rows, batches_id, batches_freq)))
+    #     simulators[i].start()
+
+    # for i in range(num_loop):
+    #     simulators[i].join()
+    #     cost = costs[i].get()
+    #     accumulated_cost = accumulated_cost + cost
+    #     print("[random route " + str(i + 1) + "] cost = " + str(cost))
+    # cost = accumulated_cost / num_loop
+
+    '''------------------------------- End ------------------------------'''
 
     planning_time = time.time() - dataloading_time - start_time
 
     print("Cost: " + str(cost) + ", dataloading_time: " + str(dataloading_time) + ", planning_time: " + str(planning_time))
-    planner.to_parquet("-15-256-2")
+    if PLAN_FILE_NAME is not None:
+        planner.to_parquet(PLAN_FILE_NAME)
+
+
+    

@@ -16,6 +16,8 @@ Date:   Sun Sep 17 17:10:02 2023 -0700
 
 ### Necessary code modifications for my pytorch runtime environment
 
+Note: These modifications are specifically for python 3.8.12 + pytorch 1.10. Different software environment might need or need not these modifications to run the stock FAE codes.
+
 1. Replace
 
 ```python
@@ -30,7 +32,30 @@ with torch.autograd.profiler.profile(enabled=args.enable_profiling, use_cuda=use
 
 2. Replace
 
-dlrm.fae.py line 1390 and line 1726
+dlrm\_fae.py line 1390 and line 1726
+
+```python
+hot_row = emb_dict[(emb_no, emb_row)]
+```
+
+With
+
+```python
+hot_row = int(emb_dict[(emb_no, emb_row)])
+```
+
+3. Add
+
+```bash
+...... \
+--arch-embedding-size="987994-4162024-9439"\
+```
+
+to the end of 'TBSM\run\_fae\_profiler.sh'
+
+4. TBSM/tbsm\_fae.py line 714
+
+Replace
 
 ```python
 hot_row = emb_dict[(emb_no, emb_row)]
