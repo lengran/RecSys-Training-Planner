@@ -501,7 +501,7 @@ def iterate_val_data(val_ld, tbsm, use_gpu, device):
 # iterate through training data, which is called once every epoch. It updates weights,
 # computes loss, accuracy, saves model if needed and calls iterate_val_data() function.
 # isMainTraining is True for main training and False for fast seed selection
-def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer, losses, accuracies, isMainTraining):
+def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer, losses, accuracies, isMainTraining, data_manager: DataManager):
 	# select number of batches
 	if isMainTraining:
 		nbatches = len(train_ld) if args.num_batches == 0 else args.num_batches
@@ -521,52 +521,72 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 	backward_time = 0
 	optimizer_time = 0
 
-	start_time = time.time()
+	data_manager.prefetching_signal.set()
 
+	start_time = time.time()
+	last_iteration_time_stamp = time.time()
 	for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
 		if j >= nbatches:
 			break
 		t1 = time_wrap(use_gpu)
 		batchSize = X[0].shape[0]
-		# forward pass
-		begin_forward = time_wrap(use_gpu)
 
-		# debug
-		# print("----------------------[Training (" + str(j) + ")]----------------------")
+		# # Wait for data
+		# if j >= data_manager.batch_pointer:
+		# 	data_manager.training_ready.clear()
+		# 	data_manager.training_ready.wait()
 
-		Z = tbsm(*data_wrap(X,
-			lS_o,
-			lS_i,
-			use_gpu,
-			device
-		))
+		try:
+			# forward pass
+			begin_forward = time_wrap(use_gpu)
 
-		end_forward = time_wrap(use_gpu)
+			# debug
+			# print("----------------------[Training (" + str(j) + ")]----------------------")
+			Z = tbsm(*data_wrap(X,
+				lS_o,
+				lS_i,
+				use_gpu,
+				device
+			))
 
-		# loss
-		E = loss_fn_wrap(Z, T, use_gpu, device)
-		# compute loss and accuracy
-		L = E.detach().cpu().numpy()  # numpy array
-		z = Z.detach().cpu().numpy()  # numpy array
-		t = T.detach().cpu().numpy()  # numpy array
-		# rounding t
-		A = np.sum((np.round(z, 0) == np.round(t, 0)).astype(np.uint8))
+			end_forward = time_wrap(use_gpu)
 
-		optimizer.zero_grad()
+			# loss
+			E = loss_fn_wrap(Z, T, use_gpu, device)
+			# compute loss and accuracy
+			L = E.detach().cpu().numpy()  # numpy array
+			z = Z.detach().cpu().numpy()  # numpy array
+			t = T.detach().cpu().numpy()  # numpy array
+			# rounding t
+			A = np.sum((np.round(z, 0) == np.round(t, 0)).astype(np.uint8))
 
-		# backward pass
-		E.backward(retain_graph=True)
-				
-		end_backward = time_wrap(use_gpu)
+			optimizer.zero_grad()
 
-		# weights update
-		optimizer.step()
+			# backward pass
+			E.backward(retain_graph=True)
+
+			end_backward = time_wrap(use_gpu)
+
+			# weights update
+			optimizer.step()
+
+			end_optimizing = time_wrap(use_gpu)
+		
+		except Exception as e:
+			data_manager.prefetching_signal.clear()
+			
+			import pdb; pdb.set_trace()
+			import traceback; traceback.print_exc()
 
 		# update batch stamp of embedding cache rows
 		with torch.no_grad():
-			tbsm.dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
-
-		end_optimizing = time_wrap(use_gpu)
+			# tbsm.dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
+			data_manager.gpu_cache._finished_batch += 1
+			data_manager.prefetching_ready.set()
+			# print("[Training] Finish training on batch " + str(j) + " (" + str(end_optimizing - last_iteration_time_stamp) + "s)")
+			last_iteration_time_stamp = end_optimizing
+			# import pdb; pdb.set_trace()
+			# time.sleep(5)
 
 		t2 = time_wrap(use_gpu)
 		total_time += t2 - t1
@@ -578,7 +598,8 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 		backward_time += end_backward - end_forward
 		optimizer_time += end_optimizing - end_backward
 
-		print_tl = (j == 0) or ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
+		print_tl = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches) # or (j == 0)
+
 		# print time, loss and accuracy
 		if print_tl and isMainTraining:
 
@@ -626,6 +647,7 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 			should_test = (j == min(int(0.05 * len(train_ld)), len(train_ld) - 1))
 
 		#  validation run
+		should_test = False
 		if should_test:
 
 			total_accu_test, total_samp_test, total_loss_val = iterate_val_data(val_ld, tbsm, use_gpu, device)
@@ -735,7 +757,7 @@ def train_tbsm(args, use_gpu):
 	with torch.autograd.profiler.profile(enabled=args.enable_profiling, use_cuda=use_gpu) as prof:
 		for k in range(args.nepochs):
 			iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device,
-			writer, losses, accuracies, isMainTraining)
+			writer, losses, accuracies, isMainTraining, data_manager)
 
 	# debug prints
 	if args.debug_mode:
@@ -754,6 +776,7 @@ def train_tbsm(args, use_gpu):
 			)
 			prof.export_chrome_trace("./tbsm_pytorch.json")
 
+	data_manager.prefetching_thread.join()
 	return
 
 # evaluates model on test data and computes AUC metric

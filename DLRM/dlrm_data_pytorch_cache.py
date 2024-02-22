@@ -4,6 +4,9 @@ from cached_embeddingbag import CacheManager
 import torch
 from typing import Sized, Optional, Iterator, List
 import pandas
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor as ConcurrentPoolExecutor             # rename this to support future transparent change to process based parallel execution
+import time
 
 class CriteoDataset_WithListIndexSupport(CriteoDataset):
     def __getitem__(self, index):
@@ -175,10 +178,11 @@ class Data_Manager(object):
             embedding_dim = args.arch_sparse_feature_size
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True)#, async_copy=True, buffer_size=0)
 
+            self.data_path = args.training_plan_dir
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
-            # custom_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
-            custom_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
+            # custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None)
+            custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
@@ -202,6 +206,9 @@ class Data_Manager(object):
                 drop_last=False,  # True
             )
 
+            self.sleep_interval = 10        # a large number (seconds)
+            self._load_time_stamp = time.time()
+
     def collate_cached_wrapper_criteo(self, list_of_tuples):
         '''
         Customized collate function that update cache.
@@ -224,5 +231,89 @@ class Data_Manager(object):
 
         lS_i = [X_cat[:, i] for i in range(featureCnt)]
         lS_o = [torch.tensor(range(batchSize)) for _ in range(featureCnt)]
+        _tmp_time_stamp = time.time()
+        self.sleep_interval = min(self.sleep_interval, _tmp_time_stamp - self._load_time_stamp)
+        self._load_time_stamp = _tmp_time_stamp
 
         return X_int, torch.stack(lS_o), torch.stack(lS_i), T
+
+    # def PlannedCacheRowLoader(self):
+    #     """
+    #     A separate thread, prefetching planed embedding entries as far as it can.
+    #     Issue prefetching request with specified rows operations.
+    #     NOTE: This function hasn't been tested.
+    #     """
+    #     # Lists of list.
+    #     ids_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "ids.parquet")).astype(int).values.tolist()
+    #     slots_to_evict_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_evict.parquet")).astype(int).values.tolist()
+    #     slots_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_move_in.parquet")).astype(int).values.tolist()
+    #     slots_to_update_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_update.parquet")).astype(int).values.tolist()
+    #     batch_pointer = 0
+
+    #     import pdb; pdb.set_trace()
+    #     while True:
+    #         print("Prefetching embedding entries for batch " + str(batch_pointer) + ".")
+    #         ids_to_move_in = ids_to_move_in_batches[batch_pointer]
+    #         slots_to_evict = slots_to_evict_batches[batch_pointer]
+    #         slots_to_move_in = slots_to_move_in_batches[batch_pointer]
+    #         slots_to_update = slots_to_update_batches[batch_pointer]
+
+    #         # move rows to gpu (a temporary place not directly to cache)
+    #         # TODO: Why are these code here? Shouldn't them belong to the cache manager?
+    #         cpu_row_idxs_to_move_in = self.idx_map.index_select(0, ids_to_move_in.to(torch.cuda.current_device()))
+    #         cpu_row_idxs_to_move_in_copy = cpu_row_idxs_to_move_in.cpu()
+    #         if self._async_copy:
+    #             if self.buffer_size == 0:
+    #                 evict_in_rows_gpu = (
+    #                     self.weight.view(self.num_embeddings, -1).index_select(0, cpu_row_idxs_to_move_in_copy).pin_memory()
+    #                 )
+    #                 with torch.cuda.stream(self._memcpy_stream):
+    #                     evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
+    #             else:
+    #                 raise NotImplemented
+
+
+    #         succeed = self.gpu_cache.new_prepare_ids(ids_to_move_in, batch_pointer, slots_to_evict, slots_to_move_in, slots_to_update, evict_in_rows_gpu)
+
+    #         if succeed:
+    #             batch_pointer += 1
+    #         else:
+    #             while not succeed:
+    #                 time.sleep(self.sleep_interval)
+    
+    # def CacheRowLoader(self):
+    #     """
+    #     A separate thread, prefetching embedding entries as far as it can.
+    #     Issue prefetching request.
+    #     """
+    #     # Lists of list.
+    #     ids_batches = pandas.read_parquet(path.join(self.data_path, "ids.parquet")).values.tolist()
+        
+    #     batch_pointer = 0
+
+    #     import pdb; pdb.set_trace()
+    #     while True:
+    #         print("Prefetching embedding entries for batch " + str(batch_pointer) + ".")
+    #         ids_batch = ids_batches[batch_pointer]
+
+    #         # move rows to gpu (a temporary place not directly to cache)
+    #         cpu_row_idxs_to_move_in = self.idx_map.index_select(0, ids_to_move_in.to(torch.cuda.current_device()))
+    #         cpu_row_idxs_to_move_in_copy = cpu_row_idxs_to_move_in.cpu()
+    #         if self._async_copy:
+    #             if self.buffer_size == 0:
+    #                 evict_in_rows_gpu = (
+    #                     self.weight.view(self.num_embeddings, -1).index_select(0, cpu_row_idxs_to_move_in_copy).pin_memory()
+    #                 )
+    #                 with torch.cuda.stream(self._memcpy_stream):
+    #                     evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
+    #             else:
+    #                 raise NotImplemented
+
+
+    #         succeed = self.gpu_cache.new_prepare_ids(ids_to_move_in, batch_pointer, slots_to_evict, slots_to_move_in, slots_to_update, evict_in_rows_gpu)
+
+    #         if succeed:
+    #             batch_pointer += 1
+    #         else:
+    #             while not succeed:
+    #                 time.sleep(self.sleep_interval)

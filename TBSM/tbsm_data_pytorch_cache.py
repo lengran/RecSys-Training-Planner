@@ -11,6 +11,8 @@ from typing import Sized, Optional, Iterator, List
 # public packages
 import torch
 import pandas
+import time
+import threading
 
 class TBSMDataset_WithListIndexSupport(TBSMDataset):
     def __getitem__(self, index):
@@ -135,7 +137,8 @@ class DataManager():
         )
 
         # Create empty cache
-        self.batch_pointer = 0
+        self.batch_pointer = 0      # infinite prefetching count
+        self.loader_count = 0       # dataloader count
         self.num_cat_counts = [987994, 4162024, 9439]        # I got these three values from the dataset init method.
         num_embedding_rows = 0
         self.offsets = list()
@@ -176,6 +179,22 @@ class DataManager():
             sampler=val_sampler,
         )
 
+        # debug
+        self.prefetching_signal = threading.Event()             # Use this to block prefetching
+        self.prefetching_ready = threading.Event()              # Use this to temporarily pause prefetching when there isn't enough space in cache.
+        self.training_ready = threading.Event()
+
+        self.infinite_prefetch = True
+
+        if self.infinite_prefetch:
+            self.prefetch_wait_step_limit = 75
+            self.prefetch_wait_step_count = self.prefetch_wait_step_limit
+            self.prefetching_ready.set()
+            self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir])
+            self.prefetching_thread.start()
+        else:
+            self.training_ready.set()
+
         # return loader, len(data)
 
     # defines transform to be performed during each call to batch,
@@ -193,17 +212,34 @@ class DataManager():
         all_cat = torch.tensor(data[0], dtype=torch.long, device=torch.cuda.current_device())
         all_int = torch.tensor(data[1], dtype=torch.float, device=torch.cuda.current_device())
 
-        # Update cache and batch pointer
-        tmp = 0
-        tmp_offset = list()
-        for i in range(len(self.num_cat_counts)):
-            tmp_offset.append([tmp] * all_cat.shape[2])
-            tmp = tmp + self.num_cat_counts[i]
-        tmp_tensor = torch.tensor(tmp_offset, device=torch.cuda.current_device())
-        ids = all_cat + tmp_tensor
-        unique_ids = torch.unique(ids.flatten())
-        self.gpu_cache.prepare_ids(unique_ids, self.batch_pointer)
-        self.batch_pointer = self.batch_pointer + 1
+        
+        if self.infinite_prefetch:
+            # Update cache and batch pointer (Replaced by infinite prefetching)
+            # print("[Dataloader] Loading batch " + str(self.loader_count) + ", current prefetching step is " + str(self.batch_pointer))
+            if self.loader_count >= self.batch_pointer:
+                self.prefetch_wait_step_count = self.prefetch_wait_step_limit
+                # print("[Warning] Training waits!")
+                # start_time = time.time()
+                self.training_ready.clear()
+                self.training_ready.wait()
+                # end_time = time.time()
+                # print("[Warning] Training has waited for " + str(end_time - start_time) + " seconds.")
+    
+            self.loader_count += 1
+        else:
+            # start_time = time.time()
+            tmp = 0
+            tmp_offset = list()
+            for i in range(len(self.num_cat_counts)):
+                tmp_offset.append([tmp] * all_cat.shape[2])
+                tmp = tmp + self.num_cat_counts[i]
+            tmp_tensor = torch.tensor(tmp_offset, device=torch.cuda.current_device())
+            ids = all_cat + tmp_tensor
+            unique_ids = torch.unique(ids.flatten())
+            self.gpu_cache.none_lfu_prepare_ids(unique_ids, self.batch_pointer)
+            self.batch_pointer = self.batch_pointer + 1
+            # end_time = time.time()
+            # print("[Synchronized fetching] Finished for batch " + str(self.batch_pointer) + " (" + str(end_time - start_time) + "s)")
 
         # print("shapes:", all_cat.shape, all_int.shape)
 
@@ -288,3 +324,176 @@ class DataManager():
 
         return X, lS_o, lS_i, T
     '''
+
+    def PlannedCacheRowLoader(self):
+        """
+        A separate thread, prefetching planed embedding entries as far as it can.
+        Issue prefetching request with specified rows operations.
+        NOTE: This function hasn't been tested.
+        """
+        # Lists of list.
+        ids_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "ids.parquet")).astype(int).values.tolist()
+        slots_to_evict_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_evict.parquet")).astype(int).values.tolist()
+        slots_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_move_in.parquet")).astype(int).values.tolist()
+        slots_to_update_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_update.parquet")).astype(int).values.tolist()
+        batch_pointer = 0
+
+        while True:
+            print("Prefetching embedding entries for batch " + str(batch_pointer) + ".")
+            ids_to_move_in = ids_to_move_in_batches[batch_pointer]
+            slots_to_evict = slots_to_evict_batches[batch_pointer]
+            slots_to_move_in = slots_to_move_in_batches[batch_pointer]
+            slots_to_update = slots_to_update_batches[batch_pointer]
+
+            # move rows to gpu (a temporary place not directly to cache)
+            # TODO: Why are these code here? Shouldn't them belong to the cache manager?
+            cpu_row_idxs_to_move_in = self.idx_map.index_select(0, ids_to_move_in.to(torch.cuda.current_device()))
+            cpu_row_idxs_to_move_in_copy = cpu_row_idxs_to_move_in.cpu()
+            if self._async_copy:
+                if self.buffer_size == 0:
+                    evict_in_rows_gpu = (
+                        self.weight.view(self.num_embeddings, -1).index_select(0, cpu_row_idxs_to_move_in_copy).pin_memory()
+                    )
+                    with torch.cuda.stream(self._memcpy_stream):
+                        evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
+                else:
+                    raise NotImplemented
+
+
+            succeed = self.gpu_cache.new_prepare_ids(ids_to_move_in, batch_pointer, slots_to_evict, slots_to_move_in, slots_to_update, evict_in_rows_gpu)
+
+            if succeed:
+                batch_pointer += 1
+            else:
+                while not succeed:
+                    time.sleep(self.sleep_interval)
+    
+    @torch.no_grad()
+    def NoneLFUCacheRowLoader(self, plan_path: str):
+        """
+        A separate thread, prefetching embedding entries as far as it can.
+        Issue prefetching request.
+        """
+        # Lists of list.
+        ids_batches = pandas.read_parquet(path.join(plan_path, "id_to_prefetch.parquet"))["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
+        
+        self.batch_pointer = 0
+
+        for _ in range(len(ids_batches)):
+            # start_time = time.time()
+            # First compute which ids need to be transfered.
+            self.prefetching_signal.wait()
+            # print("[Infinite Prefetching] Prefetching embedding entries for batch " + str(self.batch_pointer) + ".")
+            ids_batch = torch.tensor(ids_batches[self.batch_pointer], device=torch.cuda.current_device())
+            cpu_row_idxs = self.gpu_cache.idx_map.index_select(0, ids_batch)                                                    # The indices are unique.
+            # self.gpu_cache.evict_backlist = cpu_row_idxs
+            mask_comm_cpu_row_idxs = torch.isin(cpu_row_idxs, self.gpu_cache.cached_idx_map, invert=True)
+            comm_cpu_row_idxs = cpu_row_idxs[mask_comm_cpu_row_idxs]
+            update_cpu_row_idxs = cpu_row_idxs[torch.logical_not(mask_comm_cpu_row_idxs)]
+
+            # Update batch flags to protect useful rows from being evicted.
+            gpu_idxs_to_update_flag = self.gpu_cache.inverted_cached_idx[update_cpu_row_idxs]
+            self.gpu_cache.batch_flags.index_fill_(0, gpu_idxs_to_update_flag, self.batch_pointer)
+
+            # Move rows to gpu (to a temporary buffer, not directly to cache rows)
+            self.prefetching_signal.wait()
+            comm_cpu_row_idxs_copy = comm_cpu_row_idxs.cpu()
+            if self.gpu_cache._async_copy:
+                if self.gpu_cache.buffer_size == 0:
+                    evict_in_rows_gpu = self.gpu_cache.weight.view(self.gpu_cache.num_embeddings, -1).index_select(0, comm_cpu_row_idxs_copy).pin_memory()
+                    with torch.cuda.stream(self.gpu_cache._memcpy_stream):
+                        evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
+                else:
+                    raise NotImplemented
+
+            # Receive data on GPU. This part could be blocked and could be resumed by the training script.
+            succeed = self.gpu_cache.none_lfu_new_prepare_ids_part_2(comm_cpu_row_idxs, self.batch_pointer, evict_in_rows_gpu)
+            # begin_wait = time.time()
+            # waiting_time = 0
+            self.prefetch_wait_step_count = 0
+            while not succeed:
+                self.prefetching_ready.clear()
+                
+                while self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
+                    self.prefetching_ready.wait()
+                    self.prefetch_wait_step_count += 1
+                    # if self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
+                    self.prefetching_ready.clear()
+
+                # end_wait = time.time()
+                # waiting_time = end_wait - begin_wait
+                succeed = self.gpu_cache.none_lfu_new_prepare_ids_part_2(comm_cpu_row_idxs, self.batch_pointer, evict_in_rows_gpu)
+        
+            self.batch_pointer += 1
+            self.training_ready.set()
+            # end_time = time.time()
+            # print("[Infinite Prefetching] Finished prefetching for batch " + str(self.batch_pointer) + " (" + str(end_time - start_time - waiting_time) + "s, waiting time " + str(waiting_time) + ")")
+
+    @torch.no_grad()
+    def CacheRowLoader(self, plan_path: str):
+        """
+        A separate thread, prefetching embedding entries as far as it can.
+        Issue prefetching request.
+        """
+        # Lists of list.
+        data = pandas.read_parquet(path.join(plan_path, "id_to_prefetch.parquet"))
+        ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
+        freq_batches = data["freq_planed_batches"].tolist()
+        
+        self.batch_pointer = 0
+
+        for _ in range(len(ids_batches)):
+            # start_time = time.time()
+            # First compute which ids need to be transfered.
+            self.prefetching_signal.wait()
+            # print("[Infinite Prefetching] Prefetching embedding entries for batch " + str(self.batch_pointer) + ".")
+            ids_batch = torch.tensor(ids_batches[self.batch_pointer], device=torch.cuda.current_device())
+            freq_batch = torch.tensor(freq_batches[self.batch_pointer], device=torch.cuda.current_device(), dtype=self.gpu_cache.freq_cnter.dtype)
+            cpu_row_idxs = self.gpu_cache.idx_map.index_select(0, ids_batch)                                                    # The indices are unique.
+            # self.gpu_cache.evict_backlist = cpu_row_idxs
+            mask_comm_cpu_row_idxs = torch.isin(cpu_row_idxs, self.gpu_cache.cached_idx_map, invert=True)
+            comm_cpu_row_idxs = cpu_row_idxs[mask_comm_cpu_row_idxs]
+            mask_update_cpu_row_idxs = torch.logical_not(mask_comm_cpu_row_idxs)
+
+            # Update batch flags to protect useful rows from being evicted.
+            update_cpu_row_idxs = cpu_row_idxs[mask_update_cpu_row_idxs]
+            update_freq = freq_batch[mask_update_cpu_row_idxs]
+            gpu_idxs_to_update_flag = self.gpu_cache.inverted_cached_idx[update_cpu_row_idxs]
+            self.gpu_cache.batch_flags.index_fill_(0, gpu_idxs_to_update_flag, self.batch_pointer)
+            self.gpu_cache.freq_cnter.scatter_add_(0, gpu_idxs_to_update_flag, update_freq)
+
+            # Move rows to gpu (to a temporary buffer, not directly to cache rows)
+            comm_cpu_row_idxs_copy = comm_cpu_row_idxs.cpu()
+            if self.gpu_cache._async_copy and self.gpu_cache.buffer_size == 0:
+                evict_in_rows_gpu = self.gpu_cache.weight.view(self.gpu_cache.num_embeddings, -1).index_select(0, comm_cpu_row_idxs_copy).pin_memory()
+                with torch.cuda.stream(self.gpu_cache._memcpy_stream):
+                    evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
+            else:
+                raise NotImplemented
+
+            # Receive data on GPU. This part could be blocked and could be resumed by the training script.
+            comm_freq = freq_batch[mask_comm_cpu_row_idxs]
+            succeed = self.gpu_cache.new_prepare_ids_part_2(comm_cpu_row_idxs, self.batch_pointer, evict_in_rows_gpu, comm_freq)
+            # begin_wait = time.time()
+            # waiting_time = 0
+            self.prefetch_wait_step_count = 0
+            while not succeed:
+                # print("[Infinite Prefetching] No enough rows. Prefetching waits.")
+                self.prefetching_ready.clear()
+                self.prefetching_ready.wait()
+                
+                # Potential risk of a dead lock situation
+                while self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
+                    self.prefetching_ready.wait()
+                    self.prefetch_wait_step_count += 1
+                    # if self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
+                    self.prefetching_ready.clear()
+
+                # end_wait = time.time()
+                # waiting_time = end_wait - begin_wait
+                succeed = self.gpu_cache.new_prepare_ids_part_2(comm_cpu_row_idxs, self.batch_pointer, evict_in_rows_gpu, comm_freq)
+        
+            self.batch_pointer += 1
+            self.training_ready.set()
+            # end_time = time.time()
+            # print("[Infinite Prefetching] Finished prefetching for batch " + str(self.batch_pointer - 1) + " (" + str(end_time - start_time - waiting_time) + "s, waiting time " + str(waiting_time) + ")")
