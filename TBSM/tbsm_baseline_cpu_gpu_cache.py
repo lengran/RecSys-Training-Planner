@@ -584,7 +584,7 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 			data_manager.gpu_cache._finished_batch += 1
 			data_manager.prefetching_ready.set()
 			# print("[Training] Finish training on batch " + str(j) + " (" + str(end_optimizing - last_iteration_time_stamp) + "s)")
-			last_iteration_time_stamp = end_optimizing
+			# last_iteration_time_stamp = end_optimizing
 			# import pdb; pdb.set_trace()
 			# time.sleep(5)
 

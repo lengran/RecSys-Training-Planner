@@ -13,7 +13,7 @@ import heapq
 
 LARGE_NUMBER = 10000000
 CACHE_RATIO = 0.20
-DATASET = "taobao"
+DATASET = "criteo"
 BATCH_FILE_SUFFIX = "-1024"
 LOG_PATH = "/root/files/coding/data_loading_planner/taobao_run_3"
 PLAN_FILE_NAME = None #"-LFU-20-16384-2"
@@ -1826,8 +1826,8 @@ if __name__ == "__main__":
     # cost = accumulated_cost / num_loop
 
     '''------------------------------- Convertor ------------------------------'''
-    input_path = os.path.join(TBSM_PLAN_PATH, "training_plan-15-1024-2.parquet")
-    output_path = os.path.join(TBSM_PLAN_PATH, "id_to_prefetch.parquet")
+    input_path = os.path.join(DLRM_PLAN_PATH, "training_plan-29.parquet")
+    output_path = os.path.join(DLRM_PLAN_PATH, "id_to_prefetch.parquet")
     Training_Plan_to_ID_of_Batches(input_path, output_path, batches_id, batches_freq)
 
     

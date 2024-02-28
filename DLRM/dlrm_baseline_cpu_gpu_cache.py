@@ -910,6 +910,9 @@ if __name__ == "__main__":
 			if args.mlperf_logging:
 				previous_iteration_time = None
 
+			# last_iteration_time_stamp = time.time()
+			prefetching_wait_step_limit = 1100
+			prefetching_wait_step_count = 0
 			for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
 				if j == 0 and args.save_onnx:
 					(X_onnx, lS_o_onnx, lS_i_onnx) = (X, lS_o, lS_i)
@@ -979,8 +982,8 @@ if __name__ == "__main__":
 					optimizer.step()
 
 					# update cache row's batch flags
-					with torch.no_grad():
-						dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
+					# with torch.no_grad():
+						# dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
 						# for i in range(len(dlrm.emb_l)):
 						# 	dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
 
@@ -989,6 +992,17 @@ if __name__ == "__main__":
 					lr_scheduler.step()
 
 					end_scheduling = time_wrap(use_gpu)
+
+					# Unlock the prefetching thread
+					with torch.no_grad():
+						data_mgr.gpu_cache._finished_batch += 1
+						if prefetching_wait_step_count > prefetching_wait_step_limit:
+							prefetching_wait_step_count = 0
+							data_mgr.prefetching_ready.set()
+						else:
+							prefetching_wait_step_count += 1
+						# print("[Training] Finish training on batch " + str(j) + " (" + str(end_scheduling - last_iteration_time_stamp) + "s)")
+						# last_iteration_time_stamp = end_scheduling
 
 				if args.mlperf_logging:
 					total_time += iteration_time

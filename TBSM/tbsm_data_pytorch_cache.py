@@ -218,6 +218,7 @@ class DataManager():
             # print("[Dataloader] Loading batch " + str(self.loader_count) + ", current prefetching step is " + str(self.batch_pointer))
             if self.loader_count >= self.batch_pointer:
                 self.prefetch_wait_step_count = self.prefetch_wait_step_limit
+                self.prefetching_ready.set()
                 # print("[Warning] Training waits!")
                 # start_time = time.time()
                 self.training_ready.clear()
