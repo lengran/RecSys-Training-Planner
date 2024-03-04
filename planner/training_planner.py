@@ -12,11 +12,11 @@ from multiprocessing import Process, Queue, get_context
 import heapq
 
 LARGE_NUMBER = 10000000
-CACHE_RATIO = 0.20
+CACHE_RATIO = 0.50
 DATASET = "criteo"
 BATCH_FILE_SUFFIX = "-1024"
 LOG_PATH = "/root/files/coding/data_loading_planner/taobao_run_3"
-PLAN_FILE_NAME = None #"-LFU-20-16384-2"
+PLAN_FILE_NAME = "-5-1024-1"
 DLRM_GPU_CACHE_SIZE = int(33762577 * CACHE_RATIO)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
 TBSM_GPU_CACHE_SIZE = int(5159457 * CACHE_RATIO)                                                        # num of rows * cache_ratio
 DLRM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
@@ -1068,6 +1068,169 @@ def New_Heuristic_Search(
 
     return plan, cost_total, cache_state, freq_state
 
+def New_None_LFU_Heuristic_Search(
+        log_path: str, 
+        cached_rows: int, 
+        batches_id: list,  
+        warm_up_steps:int = 0, 
+        init_plan: list = None, 
+        init_cache_state: np.ndarray = None, 
+        init_cost: int = None, 
+        process_id: int = None, 
+        search_limit: int = 2000,
+        hotness_diff_threshold_base_relax_ratio: float = 0.8,
+        hotness_diff_threshold_update_window: int = 10,
+        hotness_diff_threshold_startup_cap: int = 10,
+        hotness_diff_threshold_increment_relax_ratio: float = 0.001,
+        hotness_diff_threshold_late_time_cap: float = 1,
+        hotness_diff_threshold_relax_ratio_penalty_rate: float = 0.8,
+        ) -> tuple:
+    num_batches = len(batches_id)
+    
+    if process_id is not None:
+        process_info = "[Process " + str(process_id) + "] "
+        log_file_suffix = "-" + str(process_id)
+    else:
+        process_info = ""
+        log_file_suffix = ""
+    log_file_path = os.path.join(log_path, ("search-log" + log_file_suffix + ".txt"))
+    search_log = open(log_file_path, "w")
+    # search_log_l2 = open(os.path.join(log_path, "search-log-level-2" + log_file_suffix + ".txt"), "w")
+
+    if isinstance(init_plan, list):
+        plan = init_plan
+    else:
+        plan = list()
+    
+    unused_batch = [i for i in range(num_batches) if i not in plan]
+    random.shuffle(unused_batch)
+
+    # The warm up phase (randomly fill in some steps since the first few steps don't really matter that much.)
+    time_warmup_start = time.time()
+    if len(plan) < warm_up_steps:
+        fill_in_length = warm_up_steps - len(plan)
+        plan = plan + unused_batch[ : fill_in_length]
+        del unused_batch[ : fill_in_length]
+    if init_cache_state is not None and init_cost is not None:
+        cost_total = init_cost
+        cache_state = init_cache_state
+    else:
+        cost_total, cache_state = Non_LFU_Simulate_Cost(plan, cached_rows, batches_id)
+    
+    time_warmup_finished = time.time()
+
+    # Set up the hotness difference threshold.
+    hotness_diff_threshold = LARGE_NUMBER
+    hotness_diff_history = [hotness_diff_threshold] * hotness_diff_threshold_update_window
+    hotness_diff_history_idx = 0
+    hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio
+    hotness_diff_threshold_ratio_increment = 0
+
+    # output_str = "[Warm up phase] cost: " + str(cost_total) + ", cache_usage: " + str(len(cache_state) / cached_rows) + " warmup time: " + str(time_warmup_finished - time_warmup_start) + "\n[Startup plan] " + str(plan) + "\n[Start searching] hotness_diff threshold = " + str(hotness_diff_threshold)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    # Searching
+    time_last_step = time.time()
+    start_step = len(plan)
+    for step in range(start_step, num_batches):
+        # Print progress
+        if ((step - start_step) % (int((num_batches - start_step) / 100) + 1)) == 0:
+            print(process_info + str(int((step - start_step) / ((num_batches - start_step) / 100))) + "%")
+        
+        cost_best_choice = LARGE_NUMBER
+        # cache_state_best_choice = None
+        best_choice = 0
+        cost_worst_choice = 0
+        num_available_rows = np.count_nonzero(cache_state == -1)
+
+        # Search at most self.search_limit steps to find a choice
+        for choice_idx in range(len(unused_batch)):
+            # Just calculate cost, don't update cache.
+            batch_id = batches_id[unused_batch[choice_idx]]
+            mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+            ids_to_comm = batch_id[mask_ids_to_comm]
+            num_ids_to_comm = len(ids_to_comm)                                                                              # Cost 1: cost of moving data in
+            num_rows_to_evic = num_ids_to_comm - num_available_rows
+            num_rows_to_evic = num_rows_to_evic if num_rows_to_evic > 0 else 0                                              # Cost 2: cost of moving data out
+            cost_tmp = num_ids_to_comm + num_rows_to_evic
+            
+            # Record a better/worse choice
+            if cost_tmp < cost_best_choice:
+                cost_best_choice = cost_tmp
+                best_choice = choice_idx
+            if cost_tmp > cost_worst_choice:
+                cost_worst_choice = cost_tmp
+            
+            # Early stop conditions
+            hotness_diff_tmp = cost_worst_choice - cost_best_choice
+            if choice_idx > hotness_diff_threshold_startup_cap and hotness_diff_tmp > hotness_diff_threshold:
+                hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment + hotness_diff_threshold_increment_relax_ratio
+                hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+                break
+
+            # Late stop conditions
+            if choice_idx > search_limit or choice_idx == (len(unused_batch) - 1):
+                break
+
+            # Level 2 logging
+            # output_str = "[Choice " + str(choice_idx) +" in Step " + str(step) + "] choice: " + str(unused_batch[choice_idx]) + ", cost: " + str(cost_tmp) + ", best_cost: " + str(cost_best_choice) + ", worst_cost: " + str(cost_worst_choice) + ", hotness_diff: " + str(hotness_diff_tmp)
+            # search_log_l2.write(output_str + "\n")
+        
+        # Decide current step and actually update cache state.
+        choice = unused_batch.pop(best_choice)
+        plan.append(choice)
+        # cache_state = cache_state_best_choice
+        cost_total = cost_total + cost_best_choice
+        random.shuffle(unused_batch)
+
+        # Update cache
+        batch_id = batches_id[choice]
+
+        mask_ids_to_comm = np.isin(batch_id, cache_state, assume_unique=True, invert=True)
+        ids_to_comm = batch_id[mask_ids_to_comm]
+        num_ids_to_comm = len(ids_to_comm)
+        if num_ids_to_comm > cached_rows:
+            print("Even batch with the smallest cost exceeds the capacity of the cache.")
+        num_rows_to_evic = num_ids_to_comm - num_available_rows
+
+        if num_rows_to_evic > 0:
+            mask_evictable_row = np.isin(cache_state, batch_id, assume_unique=True, invert=True)
+            idx_nonempty_row = np.flatnonzero(mask_evictable_row)[cache_state[mask_evictable_row] != -1]
+            idx_evictable_row = idx_nonempty_row[:num_rows_to_evic]
+            cache_state[idx_evictable_row] = -1
+
+        idx_update = np.flatnonzero(cache_state == -1)[:num_ids_to_comm]
+        cache_state[idx_update] = ids_to_comm
+
+        # Update threshold
+        hotness_diff_history[hotness_diff_history_idx] = cost_worst_choice - cost_best_choice
+        hotness_diff_history_idx = (hotness_diff_history_idx + 1) % hotness_diff_threshold_update_window
+        hotness_diff_mean = np.mean(hotness_diff_history)
+        hotness_diff_threshold = hotness_diff_mean * hotness_diff_threshold_dynamic_ratio
+
+        # Any step takes more than 0.3s should be considered as slightly late, thus no increment of ralax ratio
+        step_time = time.time() - time_last_step
+        time_last_step = time.time()
+        if step_time > hotness_diff_threshold_late_time_cap:
+            hotness_diff_threshold_ratio_increment = hotness_diff_threshold_ratio_increment * hotness_diff_threshold_relax_ratio_penalty_rate
+            hotness_diff_threshold_dynamic_ratio = hotness_diff_threshold_base_relax_ratio + hotness_diff_threshold_ratio_increment
+
+        # Logging
+        
+        output_str = "[Step " + str(step) + "] choice: " + str(choice) + ", cost: " + str(cost_best_choice) + ", hotness_diff: " + str(cost_worst_choice - cost_best_choice) + ", cache_usage(last run): " + str(1 - (num_available_rows/ cached_rows)) + ", step_time = " + str(step_time) + ", searched choices: " + str(choice_idx) + "\n             hotness_diff_history: " + str(hotness_diff_history) + "\n             mean hotness_diff: " + str(hotness_diff_mean) + ", ratio_increment: " + str(hotness_diff_threshold_ratio_increment) + ", dynamic threshold ratio: " + str(hotness_diff_threshold_dynamic_ratio) + ", new threshold: " + str(hotness_diff_threshold)
+        # print(output_str)
+        search_log.write(output_str + "\n")
+    
+    # output_str = "[cost: " + str(cost_total) + "] Training plan generated: " + str(plan)
+    # print(output_str)
+    # search_log.write(output_str + "\n")
+
+    search_log.close()
+    # search_log_l2.close()
+
+    return plan, cost_total, cache_state
+
 def Wrapper_Cost(q: Queue, process_id: int, should_print:bool, plan: list, cached_rows: int, batches_id: list, batches_freq: list):
     cost, _, _ = New_Simulate_Cost(plan, cached_rows, batches_id, batches_freq, process_id=process_id, should_print=should_print)
     q.put(cost)
@@ -1779,6 +1942,19 @@ if __name__ == "__main__":
     #     hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
     #     )
 
+    plan, cost, _ = New_None_LFU_Heuristic_Search(
+        planner.log_path, 
+        planner.cached_rows, 
+        batches_id, 
+        warm_up_steps=planner.warm_up_steps, 
+        search_limit=planner.search_limit, 
+        hotness_diff_threshold_base_relax_ratio=planner.hotness_diff_threshold_base_relax_ratio, 
+        hotness_diff_threshold_relax_ratio_penalty_rate=planner.hotness_diff_threshold_relax_ratio_penalty_rate,
+        hotness_diff_threshold_increment_relax_ratio=planner.hotness_diff_threshold_increment_relax_ratio,
+        hotness_diff_threshold_late_time_cap=planner.hotness_diff_threshold_late_time_cap,
+        hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
+        )
+
     # plan, cost, count_steps = Count_Heuristic_Search(
     #     planner.log_path, 
     #     planner.cached_rows, 
@@ -1826,9 +2002,9 @@ if __name__ == "__main__":
     # cost = accumulated_cost / num_loop
 
     '''------------------------------- Convertor ------------------------------'''
-    input_path = os.path.join(DLRM_PLAN_PATH, "training_plan-29.parquet")
-    output_path = os.path.join(DLRM_PLAN_PATH, "id_to_prefetch.parquet")
-    Training_Plan_to_ID_of_Batches(input_path, output_path, batches_id, batches_freq)
+    # input_path = os.path.join(DLRM_PLAN_PATH, "training_plan-29.parquet")
+    # output_path = os.path.join(DLRM_PLAN_PATH, "id_to_prefetch.parquet")
+    # Training_Plan_to_ID_of_Batches(input_path, output_path, batches_id, batches_freq)
 
     
     '''------------------------------- End ------------------------------'''
