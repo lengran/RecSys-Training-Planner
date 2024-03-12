@@ -183,8 +183,8 @@ class Data_Manager(object):
             self.data_path = args.training_plan_dir
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
-            # custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None)
-            custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
+            custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None)
+            # custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
@@ -216,7 +216,8 @@ class Data_Manager(object):
             self.prefetching_ready = threading.Event()              # Use this to temporarily pause prefetching when there isn't enough space in cache.
             self.training_ready = threading.Event()
 
-            self.infinite_prefetch = False
+            self.infinite_prefetch = True
+            self.exit_flag = False
 
             if self.infinite_prefetch:
                 # self.prefetch_wait_step_limit = 1100
@@ -364,6 +365,8 @@ class Data_Manager(object):
         self.batch_pointer = 0
 
         for _ in range(len(ids_batches)):
+            # if self.exit_flag:
+                # return
             # start_time = time.time()
             # First compute which ids need to be transfered.
             self.prefetching_signal.wait()
@@ -397,6 +400,7 @@ class Data_Manager(object):
             # self.prefetch_wait_step_count = 0
             while not succeed:
                 self.prefetching_ready.clear()
+                self.prefetching_ready.wait()
                 
                 # while self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
                 #     self.prefetching_ready.wait()

@@ -98,7 +98,7 @@ import sklearn.metrics
 from torch.optim.lr_scheduler import _LRScheduler
 
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"]="1"
+# os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -932,6 +932,7 @@ if __name__ == "__main__":
 
 				# early exit if nbatches was set by the user and has been exceeded
 				if nbatches > 0 and j >= nbatches:
+					data_mgr.exit_flag = True
 					break
 				'''
 				# debug prints
