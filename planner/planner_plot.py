@@ -3,8 +3,14 @@ import numpy as np
 import os
 from collections import deque
 
-LOG_PATH = "/root/files/coding/data_loading_planner/plot_source"
-PLOT_PATH = "/root/files/coding/data_loading_planner/taobao_run"
+# To avoid type 3 fonts
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+
+LOG_PATH = "/root/files/coding/data_loading_planner/taobao_run_3"
+PLOT_PATH = "/root/files/coding/data_loading_planner/taobao_run_3"
 
 def Read_Steps():
     steps = dict()
@@ -40,7 +46,8 @@ def Print_Step_Plot(steps: dict, start_step: int, end_step: int, step_interval: 
 if __name__ == "__main__":
     plt.style.use('_mpl-gallery')
     
+    
     # # Print plots for steps
     steps = Read_Steps()
-    Print_Step_Plot(steps, 350, 3000, 50)
+    Print_Step_Plot(steps, 0, 16, 5)
 
