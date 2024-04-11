@@ -14,10 +14,10 @@ import json
 
 LARGE_NUMBER = 10000000
 # CACHE_RATIO = 0.50
-DATASET = "taobao"
+DATASET = "criteo"
 BATCH_FILE_SUFFIX = "-1024"
 LOG_PATH = "/root/files/coding/data_loading_planner/taobao_run_1"
-PLAN_FILE_NAME = "-LFU-15-1024-4.1"
+PLAN_FILE_NAME = None # "-LFU-15-1024-5"
 DLRM_GPU_CACHE_SIZE = int(33762577 * 0.05)                                                       # num of rows * cache_ratio                     # num of embedding entries = GB / float32 / 64 dimension
 TBSM_GPU_CACHE_SIZE = int(5159457 * 0.15)                                                        # num of rows * cache_ratio
 DLRM_DATA_PATH = "/root/files/coding/RecSys-Training-Planner/DLRM/input/kaggle/kaggleAdDisplayChallenge_processed.npz"
@@ -1840,8 +1840,18 @@ def Training_Plan_to_ID_of_Batches(input_path: str, output_path: str, id_batches
     start_time = time.time()
     data = df.read_parquet(input_path)
     training_plan = data['plan'].to_arrow().to_pylist()
+    
     # training_plan = [i for i in range(len(id_batches))]
-    import pdb; pdb.set_trace()
+    # # import pdb; pdb.set_trace()
+    # random.shuffle(training_plan)
+    # if DATASET == "criteo":
+    #     plan_path = DLRM_PLAN_PATH
+    # elif DATASET == "taobao":
+    #     plan_path = TBSM_PLAN_PATH
+    # else:
+    #     raise RuntimeError("Unrecognized  dataset")
+    # df.DataFrame({'plan': training_plan}).to_parquet(os.path.join(plan_path, ("training_plan-random.parquet")))
+    
     end_time = time.time()
     print("Training plan loaded. (" + str(end_time - start_time) + "s)")
     
@@ -2242,7 +2252,6 @@ def New_LFU_Multiprocess_Search(
         num_rows_to_evic = num_ids_to_comm - num_available_rows
 
         if num_rows_to_evic > 0:
-            import pdb; pdb.set_trace()
             mask_evictable_row = np.isin(cache_state, batch_id, assume_unique=True, invert=True)
             idx_nonempty_row = np.flatnonzero(mask_evictable_row)[cache_state[mask_evictable_row] != -1]
             # idx_evictable_row = idx_nonempty_row[:num_rows_to_evic]
@@ -2381,10 +2390,10 @@ if __name__ == "__main__":
     print("Data have been converted into ndarrays on CPU.")
 
     '''------------------------ New cost calculator ------------------------'''
-    # planner.Read_plan("training_plan-15-1024-2")
+    # planner.Read_plan("training_plan-LFU-15-1024-4.1")
     # print("number of batches: " + str(len(planner.plan)) + ", calculating cost......")
     
-    # # cost, _, _ = New_Simulate_Cost(planner.plan, planner.cached_rows, batches_id, batches_freq)
+    # cost, _, _ = New_Simulate_Cost(planner.plan, planner.cached_rows, batches_id, batches_freq)
     # cost, _ = Non_LFU_Simulate_Cost(planner.plan, planner.cached_rows, batches_id)
     
     '''------------------------ New planner ------------------------'''
@@ -2402,12 +2411,12 @@ if __name__ == "__main__":
     #     hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
     #     )
 
-    # Comment date: 20240312
-    init_plan_path = "/root/files/coding/data_loading_planner/taobao_run_1/live_backup-lfu--LFU-15-1024-4.json"
-    with open(init_plan_path, "r") as backup_file:
-        init_plan = json.load(backup_file)
+    # Comment date: 20240401
+    # init_plan_path = "/root/files/coding/data_loading_planner/taobao_run_1/live_backup-lfu--LFU-15-1024-4.json"
+    # with open(init_plan_path, "r") as backup_file:
+    #     init_plan = json.load(backup_file)
     
-    print("Initialized plan has been loaded.")
+    # print("Initialized plan has been loaded.")
 
     # plan, cost, _ = New_None_LFU_Multiprocess_Search(
     #     LOG_PATH,
@@ -2424,22 +2433,23 @@ if __name__ == "__main__":
     #     init_plan=init_plan,
     #     )
 
-    plan, cost, _, _ = New_LFU_Multiprocess_Search(
-        LOG_PATH,
-        planner.cached_rows, 
-        batches_id, 
-        batches_freq,
-        warm_up_steps=planner.warm_up_steps, 
-        search_limit=planner.search_limit, 
-        hotness_diff_threshold_base_relax_ratio=planner.hotness_diff_threshold_base_relax_ratio, 
-        hotness_diff_threshold_relax_ratio_penalty_rate=planner.hotness_diff_threshold_relax_ratio_penalty_rate,
-        hotness_diff_threshold_increment_relax_ratio=planner.hotness_diff_threshold_increment_relax_ratio,
-        hotness_diff_threshold_late_time_cap=planner.hotness_diff_threshold_late_time_cap,
-        hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
-        num_process=40,
-        init_plan=init_plan,
-    )
-    planner.plan = plan[:]
+    # Comment out date: 20240401
+    # plan, cost, _, _ = New_LFU_Multiprocess_Search(
+    #     LOG_PATH,
+    #     planner.cached_rows, 
+    #     batches_id, 
+    #     batches_freq,
+    #     warm_up_steps=planner.warm_up_steps, 
+    #     search_limit=planner.search_limit, 
+    #     hotness_diff_threshold_base_relax_ratio=planner.hotness_diff_threshold_base_relax_ratio, 
+    #     hotness_diff_threshold_relax_ratio_penalty_rate=planner.hotness_diff_threshold_relax_ratio_penalty_rate,
+    #     hotness_diff_threshold_increment_relax_ratio=planner.hotness_diff_threshold_increment_relax_ratio,
+    #     hotness_diff_threshold_late_time_cap=planner.hotness_diff_threshold_late_time_cap,
+    #     hotness_diff_threshold_startup_cap=planner.hotness_diff_threshold_startup_cap,
+    #     num_process=40,
+    #     init_plan=init_plan,
+    # )
+    # planner.plan = plan[:]
 
     # plan, cost, count_steps = Count_Heuristic_Search(
     #     planner.log_path, 
@@ -2457,7 +2467,7 @@ if __name__ == "__main__":
     
     # planner.plan = plan[:]
 
-    '''------------------------ New multiprocess planner ------------------------'''
+    '''------------------------ New (Old) multiprocess planner ------------------------'''
     # plan, cost = New_Multiprocess_Search(
     #     1200,
     #     planner.log_path,
@@ -2478,7 +2488,8 @@ if __name__ == "__main__":
     # for i in range(num_loop):
     #     random.shuffle(random_route)
     #     costs.append(Queue())
-    #     simulators.append(Process(target=New_None_LFU_Cost_Wrapper, args=(costs[i], i, random_route, planner.cached_rows, batches_id)))
+    #     # simulators.append(Process(target=New_None_LFU_Cost_Wrapper, args=(costs[i], i, random_route, planner.cached_rows, batches_id)))
+    #     simulators.append(Process(target=Wrapper_Cost, args=(costs[i], i, False, random_route, planner.cached_rows, batches_id, batches_freq)))
     #     simulators[i].start()
 
     # for i in range(num_loop):
@@ -2489,8 +2500,9 @@ if __name__ == "__main__":
     # cost = accumulated_cost / num_loop
 
     '''------------------------------- Convertor ------------------------------'''
-    # input_path = os.path.join(TBSM_PLAN_PATH, "training_plan-29.parquet")
-    # output_path = os.path.join(TBSM_PLAN_PATH, "sequence-id_to_prefetch.parquet")
+    # print("Start converting training plan to batch info...")
+    # input_path = "asdf" # os.path.join(TBSM_PLAN_PATH, "training_plan-LFU-15-1024-4.1.parquet")
+    # output_path = os.path.join(DLRM_PLAN_PATH, "id_to_prefetch-random.parquet")
     # Training_Plan_to_ID_of_Batches(input_path, output_path, batches_id, batches_freq)
 
     
@@ -2498,7 +2510,7 @@ if __name__ == "__main__":
     '''------------------------------- End ------------------------------'''
 
     planning_time = time.time() - dataloading_time - start_time
-    print("Cost: " + str(cost) + ", ")
+    # print("Cost: " + str(cost) + ", ")
     print("dataloading_time: " + str(dataloading_time) + ", planning_time: " + str(planning_time))
     if PLAN_FILE_NAME is not None:
         planner.to_parquet(PLAN_FILE_NAME)

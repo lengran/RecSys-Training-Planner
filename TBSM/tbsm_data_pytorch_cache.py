@@ -39,17 +39,22 @@ class PlanedSampler(torch.utils.data.Sampler[List[int]]):
             batch_size: Optional[int], 
             shuffle: Optional[bool], 
             drop_last: Optional[bool], 
-            dataset: Optional[Sized]
+            dataset: Optional[Sized],
+            suffix: Optional[str]
             ) -> None:
         self.data_path = path.abspath(data_path)
         if not path.exists(self.data_path):
             raise ValueError(f"The directory to write batches provided doesn't exist. Path ={data_path}")
+        if suffix is not None:
+            plan_file_name = "training_plan" + suffix + ".parquet"
+        else:
+            plan_file_name = "training_plan.parquet"
         self.ready = ready
 
         if ready:
             # If already have a training plan, just load it.
             self.batches = pandas.read_parquet(path.join(self.data_path, "batches.parquet")).astype(int).values.tolist()
-            self.training_plan = pandas.read_parquet(path.join(self.data_path, "training_plan.parquet")).astype(int).squeeze().tolist()
+            self.training_plan = pandas.read_parquet(path.join(self.data_path, plan_file_name)).astype(int).squeeze().tolist()
             self.length = len(self.training_plan)
         else:
             # If not, create samplers to generate batches (which is in method 'generate_batches').
@@ -148,11 +153,12 @@ class DataManager():
         embedding_dim = args.arch_sparse_feature_size
         self.gpu_cache = CacheManager(num_embeddings=num_embedding_rows, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True, async_copy=True, buffer_size=0)
 
+        suffix = "-random"
         # Create a special sampler to support import and export of training plans. TODO: make this switchable from outside this script, elegantly.
-        custom_train_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None)
+        custom_train_sampler = PlanedSampler(True, args.training_plan_dir, None, None, None, None, suffix)
         # custom_train_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=args.mini_batch_size, shuffle=True, drop_last=False, dataset=self.train_data)
 
-        val_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=15000, shuffle=True, drop_last=False, dataset=self.val_data)
+        val_sampler = PlanedSampler(False, args.training_plan_dir, batch_size=15000, shuffle=True, drop_last=False, dataset=self.val_data, suffix="")
 
         '''
         # debug
@@ -190,7 +196,8 @@ class DataManager():
             self.prefetch_wait_step_limit = 75
             self.prefetch_wait_step_count = self.prefetch_wait_step_limit
             self.prefetching_ready.set()
-            self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir])
+            self.prefetching_signal.set()
+            self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir, suffix])
             self.prefetching_thread.start()
         else:
             self.training_ready.set()
@@ -217,7 +224,7 @@ class DataManager():
             # Update cache and batch pointer (Replaced by infinite prefetching)
             # print("[Dataloader] Loading batch " + str(self.loader_count) + ", current prefetching step is " + str(self.batch_pointer))
             if self.loader_count >= self.batch_pointer:
-                self.prefetch_wait_step_count = self.prefetch_wait_step_limit
+                # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 # print("[Warning] Training waits!")
                 # start_time = time.time()
@@ -431,13 +438,18 @@ class DataManager():
             # print("[Infinite Prefetching] Finished prefetching for batch " + str(self.batch_pointer) + " (" + str(end_time - start_time - waiting_time) + "s, waiting time " + str(waiting_time) + ")")
 
     @torch.no_grad()
-    def CacheRowLoader(self, plan_path: str):
+    def CacheRowLoader(self, plan_path: str, suffix: str = None):
         """
         A separate thread, prefetching embedding entries as far as it can.
         Issue prefetching request.
         """
+        if suffix is not None:
+            id_file_name = "id_to_prefetch" + suffix + ".parquet"
+        else:
+            id_file_name = "id_to_prefetch.parquet"
+
         # Lists of list.
-        data = pandas.read_parquet(path.join(plan_path, "id_to_prefetch.parquet"))
+        data = pandas.read_parquet(path.join(plan_path, id_file_name))
         ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
         freq_batches = data["freq_planed_batches"].tolist()
         
@@ -477,18 +489,17 @@ class DataManager():
             succeed = self.gpu_cache.new_prepare_ids_part_2(comm_cpu_row_idxs, self.batch_pointer, evict_in_rows_gpu, comm_freq)
             # begin_wait = time.time()
             # waiting_time = 0
-            self.prefetch_wait_step_count = 0
+            # self.prefetch_wait_step_count = 0
             while not succeed:
                 # print("[Infinite Prefetching] No enough rows. Prefetching waits.")
                 self.prefetching_ready.clear()
                 self.prefetching_ready.wait()
                 
                 # Potential risk of a dead lock situation
-                while self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
-                    self.prefetching_ready.wait()
-                    self.prefetch_wait_step_count += 1
-                    # if self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
-                    self.prefetching_ready.clear()
+                # while self.prefetch_wait_step_count < self.prefetch_wait_step_limit:
+                    # self.prefetching_ready.wait()
+                    # self.prefetch_wait_step_count += 1
+                    # self.prefetching_ready.clear()
 
                 # end_wait = time.time()
                 # waiting_time = end_wait - begin_wait
@@ -496,5 +507,7 @@ class DataManager():
         
             self.batch_pointer += 1
             self.training_ready.set()
+            # self.prefetching_ready.clear()
+            # self.prefetching_ready.wait()
             # end_time = time.time()
             # print("[Infinite Prefetching] Finished prefetching for batch " + str(self.batch_pointer - 1) + " (" + str(end_time - start_time - waiting_time) + "s, waiting time " + str(waiting_time) + ")")

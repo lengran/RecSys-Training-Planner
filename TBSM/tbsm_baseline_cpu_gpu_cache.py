@@ -535,10 +535,22 @@ def iterate_train_data(args, train_ld, val_ld, tbsm, k, use_gpu, device, writer,
 		# if j >= data_manager.batch_pointer:
 		# 	data_manager.training_ready.clear()
 		# 	data_manager.training_ready.wait()
-
+		# debug_flag = True
 		try:
 			# forward pass
+			# import pdb; pdb.set_trace()
 			begin_forward = time_wrap(use_gpu)
+
+			# if debug_flag:
+			# 	ids = torch.empty((0), dtype=torch.int64, device=torch.cuda.current_device())
+
+			# 	for i in lS_i:
+			# 		for j in i:
+			# 			ids = torch.concat([ids, j])
+				
+			# 	ids = torch.unique(ids)
+			# 	idx = data_manager.gpu_cache.id_to_cached_cuda_idx(ids)
+			# 	tmp = torch.nonzero(idx == -1)
 
 			# debug
 			# print("----------------------[Training (" + str(j) + ")]----------------------")
@@ -776,7 +788,7 @@ def train_tbsm(args, use_gpu):
 			)
 			prof.export_chrome_trace("./tbsm_pytorch.json")
 
-	data_manager.prefetching_thread.join()
+	# data_manager.prefetching_thread.join()
 	return
 
 # evaluates model on test data and computes AUC metric

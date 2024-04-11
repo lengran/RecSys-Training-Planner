@@ -34,17 +34,22 @@ class PlanedSampler(torch.utils.data.Sampler[List[int]]):
             batch_size: Optional[int], 
             shuffle: Optional[bool], 
             drop_last: Optional[bool], 
-            dataset: Optional[Sized]
+            dataset: Optional[Sized],
+            suffix: Optional[str]
             ) -> None:
         self.data_path = path.abspath(data_path)
         if not path.exists(self.data_path):
             raise ValueError(f"The directory to write batches provided doesn't exist. Path ={data_path}")
+        if suffix is not None:
+            plan_file_name = "training_plan" + suffix + ".parquet"
+        else:
+            plan_file_name = "training_plan.parquet"
         self.ready = ready
 
         if ready:
             # If already have a training plan, just load it.
             self.batches = pandas.read_parquet(path.join(self.data_path, "batches.parquet")).astype(int).values.tolist()
-            self.training_plan = pandas.read_parquet(path.join(self.data_path, "training_plan.parquet")).astype(int).squeeze().tolist()
+            self.training_plan = pandas.read_parquet(path.join(self.data_path, plan_file_name)).astype(int).squeeze().tolist()
             self.length = len(self.training_plan)
         else:
             # If not, create samplers to generate batches (which is in method 'generate_batches').
@@ -178,12 +183,13 @@ class Data_Manager(object):
                 total_embedding_row = total_embedding_row + num_embedding_list[i]
 
             embedding_dim = args.arch_sparse_feature_size
-            self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True, async_copy=True, buffer_size=0)
+            self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True , async_copy=True, buffer_size=0)
 
             self.data_path = args.training_plan_dir
+            suffix = "-random"
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
-            custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None)
+            custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
             # custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
@@ -224,7 +230,7 @@ class Data_Manager(object):
                 # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 self.prefetching_signal.set()
-                self.prefetching_thread = threading.Thread(target=self.NoneLFUCacheRowLoader, args=[args.training_plan_dir])
+                self.prefetching_thread = threading.Thread(target=self.NoneLFUCacheRowLoader, args=[args.training_plan_dir, suffix])
                 self.prefetching_thread.start()
             else:
                 self.training_ready.set() 
@@ -354,13 +360,18 @@ class Data_Manager(object):
     '''
 
     @torch.no_grad()
-    def NoneLFUCacheRowLoader(self, plan_path: str):
+    def NoneLFUCacheRowLoader(self, plan_path: str, suffix: str = None):
         """
         A separate thread, prefetching embedding entries as far as it can.
         Issue prefetching request.
         """
+        if suffix is not None:
+            id_file_name = "id_to_prefetch" + suffix + ".parquet"
+        else:
+            id_file_name = "id_to_prefetch.parquet"
+
         # Lists of list.
-        ids_batches = pandas.read_parquet(path.join(plan_path, "id_to_prefetch.parquet"))["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
+        ids_batches = pandas.read_parquet(path.join(plan_path, id_file_name))["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
         
         self.batch_pointer = 0
 
