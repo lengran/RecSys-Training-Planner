@@ -61,7 +61,7 @@ import functools
 import time
 import json
 # data generation
-import dlrm_data_pytorch as dp
+import dlrm_data_pytorch_avazu as dp
 
 # numpy
 import numpy as np
@@ -85,10 +85,6 @@ from tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
-# Cached Embedding classes
-from cached_embeddingbag import CachedEmbeddingBag
-from dlrm_data_pytorch_cache_avazu import Data_Manager
-
 import sklearn.metrics
 
 # from torchviz import make_dot
@@ -96,9 +92,6 @@ import sklearn.metrics
 # from torch.nn.parameter import Parameter
 
 from torch.optim.lr_scheduler import _LRScheduler
-
-import os
-# os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -182,7 +175,6 @@ class DLRM_Net(nn.Module):
 
 	def create_emb(self, m, ln):
 		emb_l = nn.ModuleList()
-		cat_offset = 0
 		for i in range(0, ln.size):
 			n = ln[i]
 			# construct embedding operator
@@ -200,10 +192,7 @@ class DLRM_Net(nn.Module):
 				EE.embs.weight.data = torch.tensor(W, requires_grad=True)
 
 			else:
-				# EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-				# Magic happens here! (using cached embeddingbag instead of the factory one)
-				# EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cached_ratio=0.25, cache_mgr=self.cache_list[i])
-				EE = CachedEmbeddingBag(n, m, mode="sum", sparse=True, cache_mgr=self.gpu_cache, cat_offset=cat_offset)
+				EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
 
 				# initialize embeddings
 				# nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
@@ -211,21 +200,40 @@ class DLRM_Net(nn.Module):
 					low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
 				).astype(np.float32)
 				# approach 1
-				# EE.weight.data = torch.tensor(W, requires_grad=True)
+				EE.weight.data = torch.tensor(W, requires_grad=True)
 				# approach 2
 				# EE.weight.data.copy_(torch.tensor(W))
 				# approach 3
 				# EE.weight = Parameter(torch.tensor(W),requires_grad=True)
-				EE.weight.data[cat_offset:cat_offset + n, :] = torch.tensor(W)
 
 			emb_l.append(EE)
-			cat_offset = cat_offset + n
+
 		return emb_l
+
+	def create_hot_emb(self, m, ln):
+		hot_emb_l = nn.ModuleList()
+
+		EE = nn.EmbeddingBag(ln, m, mode="sum", sparse=True)
+
+		# initialize embeddings
+		# nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
+		W = np.random.uniform(low=-np.sqrt(1 / ln), high=np.sqrt(1 / ln), size=(ln, m)).astype(np.float32)
+		# approach 1
+		EE.weight.data = torch.tensor(W, requires_grad=True)
+		# approach 2
+		# EE.weight.data.copy_(torch.tensor(W))
+		# approach 3
+		# EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+
+		hot_emb_l.append(EE)
+
+		return hot_emb_l
 
 	def __init__(
 		self,
 		m_spa=None,
 		ln_emb=None,
+		ln_hot_emb = None,
 		ln_bot=None,
 		ln_top=None,
 		arch_interaction_op=None,
@@ -241,13 +249,13 @@ class DLRM_Net(nn.Module):
 		qr_threshold=200,
 		md_flag=False,
 		md_threshold=200,
-		gpu_cache=None
 	):
 		super(DLRM_Net, self).__init__()
 
 		if (
 			(m_spa is not None)
 			and (ln_emb is not None)
+			and (ln_hot_emb is not None)
 			and (ln_bot is not None)
 			and (ln_top is not None)
 			and (arch_interaction_op is not None)
@@ -273,11 +281,11 @@ class DLRM_Net(nn.Module):
 			if self.md_flag:
 				self.md_threshold = md_threshold
 			
-			# Pointer to cache managers created by the data manager
-			self.gpu_cache = gpu_cache
-			
 			self.emb_l = self.create_emb(m_spa, ln_emb)
 			print("EMB : ", ln_emb)
+			self.hot_emb_l = self.create_hot_emb(m_spa, ln_hot_emb)
+			print("Hot EMB : ", ln_hot_emb)
+			self.hot_emb_l = self.hot_emb_l.to("cuda:0")
 			self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
 			self.bot_l = self.bot_l.to("cuda:0")
 			self.top_l = self.create_mlp(ln_top, sigmoid_top)
@@ -310,6 +318,31 @@ class DLRM_Net(nn.Module):
 			# The embeddings are represented as tall matrices, with sum
 			# happening vertically across 0 axis, resulting in a row vector
 			E = emb_l[k]
+			V = E(sparse_index_group_batch, sparse_offset_group_batch)
+
+			ly.append(V)
+
+		# print(ly)
+		return ly
+
+	def apply_hot_emb(self, lS_o, lS_i, emb_l):
+		# WARNING: notice that we are processing the batch at once. We implicitly
+		# assume that the data is laid out such that:
+		# 1. each embedding is indexed with a group of sparse indices,
+		#   corresponding to a single lookup
+		# 2. for each embedding the lookups are further organized into a batch
+		# 3. for a list of embedding tables there is a list of batched lookups
+		ly = []
+		# for k, sparse_index_group_batch in enumerate(lS_i):
+		for k in range(len(lS_i)):
+			sparse_index_group_batch = lS_i[k]
+			sparse_offset_group_batch = lS_o[k]
+
+			# embedding lookup
+			# We are using EmbeddingBag, which implicitly uses sum operator.
+			# The embeddings are represented as tall matrices, with sum
+			# happening vertically across 0 axis, resulting in a row vector
+			E = emb_l[0]
 			V = E(sparse_index_group_batch, sparse_offset_group_batch)
 
 			ly.append(V)
@@ -351,9 +384,12 @@ class DLRM_Net(nn.Module):
 
 		return R
 
-	def forward(self, dense_x, lS_o, lS_i):
-		return self.mixed_forward(dense_x, lS_o, lS_i)
-		
+	def forward(self, dense_x, lS_o, lS_i, data):
+				
+		if data == "hot":
+			return self.parallel_forward(dense_x, lS_o, lS_i)
+		else:
+			return self.mixed_forward(dense_x, lS_o, lS_i)
 
 	def mixed_forward(self, dense_x, lS_o, lS_i):	
 		# Process dense features on GPU in a data parallel fashion
@@ -372,6 +408,7 @@ class DLRM_Net(nn.Module):
 			self.bot_l_replicas = replicate(self.bot_l, device_ids)
 			self.top_l_replicas = replicate(self.top_l, device_ids)
 			self.parallel_model_batch_size = batch_size
+
 
 		### prepare input (overwrite) ###
 		# scatter dense features (data parallelism)
@@ -412,7 +449,85 @@ class DLRM_Net(nn.Module):
 		# distribution of z.
 		p = parallel_apply(self.top_l_replicas, z, None, device_ids)
 
-		begin_gather = time_wrap(use_gpu)
+		### gather the distributed results ###
+		p0 = gather(p, self.output_d, dim=0)
+
+		# clamp output if needed
+		if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
+			z0 = torch.clamp(
+				p0, min=self.loss_threshold, max=(1.0 - self.loss_threshold)
+			)
+		else:
+			z0 = p0
+
+		return z0
+
+	def parallel_forward(self, dense_x, lS_o, lS_i):
+		### prepare model (overwrite) ###
+		# WARNING: # of devices must be >= batch size in parallel_forward call
+		batch_size = dense_x.size()[0]
+		ndevices = min(self.ndevices, batch_size)
+		device_ids = range(ndevices)
+		# WARNING: must redistribute the model if mini-batch size changes(this is common
+		# for last mini-batch, when # of elements in the dataset/batch size is not even
+		if self.parallel_model_batch_size != batch_size:
+			self.parallel_model_is_not_prepared = True
+		
+		if self.parallel_model_is_not_prepared or self.sync_dense_params:
+			# replicate mlp (data parallelism)
+			self.bot_l_replicas = replicate(self.bot_l, device_ids)
+			self.top_l_replicas = replicate(self.top_l, device_ids)
+			self.hot_emb_l_replicas = replicate(self.hot_emb_l, device_ids)
+			self.parallel_model_batch_size = batch_size
+
+		
+		# scatter dense features (data parallelism)
+		# print(dense_x.device)
+
+		dense_x = scatter(dense_x, device_ids, dim=0)
+
+		lS_i = scatter(lS_i, device_ids, dim=1)
+		lS_o = scatter(lS_o, device_ids, dim=1)
+		lS_o_t = lS_o[0]
+		lS_o = []
+		for i in range(ndevices):
+			lS_o.append(lS_o_t.to("cuda:"+str(i)))
+
+		### compute results in parallel ###
+		# bottom mlp
+		# WARNING: Note that the self.bot_l is a list of bottom mlp modules
+		# that have been replicated across devices, while dense_x is a tuple of dense
+		# inputs that has been scattered across devices on the first (batch) dimension.
+		# The output is a list of tensors scattered across devices according to the
+		# distribution of dense_x.
+		x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
+		# debug prints
+		# print(x)
+
+		
+		# embeddings
+		ly = []
+		
+		for i in range(ndevices):
+			y = self.apply_hot_emb(lS_o[i], lS_i[i], self.hot_emb_l_replicas[i])
+			ly.append(y)
+
+		# interactions
+		z = []
+		for k in range(ndevices):
+			zk = self.interact_features(x[k], ly[k])
+			z.append(zk)
+		# debug prints
+		# print(z)
+		
+		# top mlp
+		# WARNING: Note that the self.top_l is a list of top mlp modules that
+		# have been replicated across devices, while z is a list of interaction results
+		# that by construction are scattered across devices on the first (batch) dim.
+		# The output is a list of tensors scattered across devices according to the
+		# distribution of z.
+		p = parallel_apply(self.top_l_replicas, z, None, device_ids)
+
 		### gather the distributed results ###
 		p0 = gather(p, self.output_d, dim=0)
 			
@@ -497,6 +612,11 @@ if __name__ == "__main__":
 	parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
 	parser.add_argument("--raw-data-file", type=str, default="")
 	parser.add_argument("--processed-data-file", type=str, default="")
+	# ========================= Added train files and dict ==============================
+	parser.add_argument("--train-hot-file", type=str, default="") # train_hot.npz
+	parser.add_argument("--train-normal-file", type=str, default="") # train_normal.npz
+	parser.add_argument("--hot-emb-dict-file", type=str, default="") # hot_emb_dict.npz
+	# ===================================================================================
 	parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
 	parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
 	parser.add_argument("--max-ind-range", type=int, default=-1)
@@ -547,8 +667,6 @@ if __name__ == "__main__":
 	parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
 	parser.add_argument("--lr-decay-start-step", type=int, default=0)
 	parser.add_argument("--lr-num-decay-steps", type=int, default=0)
-	parser.add_argument("--cache-ratio", type=float, default=0.15)
-	parser.add_argument("--training-plan-dir", type=str, default="./input/training_plan")
 	args = parser.parse_args()
 
 	if args.mlperf_logging:
@@ -573,7 +691,7 @@ if __name__ == "__main__":
 		torch.backends.cudnn.deterministic = True
 		device = torch.device("cuda", 0)
 		ngpus = torch.cuda.device_count()  # 1
-		print("Running DLRM Baseline")
+		print("Running DLRM Hotshot")
 		print("Using CPU and {} GPU(s)...".format(ngpus))
 	else:
 		device = torch.device("cpu")
@@ -584,25 +702,58 @@ if __name__ == "__main__":
 	# input data
 	if (args.data_generation == "avazu"):
 
-		# train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
-		# A data object contains datasets, dataloader and cache managers.
-		data_mgr = Data_Manager(args=args)
-		train_data = data_mgr.train_data
-		train_ld = data_mgr.train_loader
-		test_data = data_mgr.test_data
-		test_ld = data_mgr.test_loader
+		# =================== Commenting actual dataset load and using just test data =====================
+		test_ld = dp.load_avazu_test_data_and_loaders(args)
+		# =================================================================================================
 
-		nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+		# ============================== Loading processed hot data and normal data =======================
+		print("Loading pre-processed Data")
+
+		train_normal = np.load(args.train_normal_file, allow_pickle = True)
+		train_normal = train_normal['arr_0']
+		train_normal = train_normal.tolist()
+		print("Length Train normal : ", len(train_normal))
+
+		train_hot = np.load(args.train_hot_file, allow_pickle = True)
+		train_hot = train_hot['arr_0']
+		train_hot = train_hot.tolist()
+		print("Length Train hot : ", len(train_hot))
+
+		hot_emb_dict = np.load(args.hot_emb_dict_file, allow_pickle = True)
+		hot_emb_dict = hot_emb_dict['arr_0']
+		hot_emb_dict = hot_emb_dict.tolist()
+		print("Length Hot emb Dict : ", len(hot_emb_dict))
+		ln_hot_emb = 0
+		for i, dict in enumerate(hot_emb_dict):
+			ln_hot_emb	= ln_hot_emb + len(dict)
+		print("ln_hot_emb : ", ln_hot_emb)
+		
+
+		path = args.raw_data_file.split('/')
+		path = path[0:len(path)-1]
+		path.append("train_fea_count.npz")
+		path = '/'.join(path)
+		data = np.load(path)
+		counts = data["counts"]
+
+		train_hot_ld, train_normal_ld = dp.load_avazu_preprocessed_data_and_loaders(args, train_hot, train_normal)
+	
+		# ===================================================================================================
+		nbatches_hot = args.num_batches if args.num_batches > 0 else len(train_hot_ld)
+		nbatches_normal = args.num_batches if args.num_batches > 0 else len(train_normal_ld)
+		nbatches = nbatches_hot + nbatches_normal
 		nbatches_test = len(test_ld)
 
-		ln_emb = train_data.counts
+		#ln_emb = train_data.counts
+		ln_emb = counts
 		# enforce maximum limit on number of vectors per embedding
 		if args.max_ind_range > 0:
 			ln_emb = np.array(list(map(
 				lambda x: x if x < args.max_ind_range else args.max_ind_range,
 				ln_emb
 			)))
-		m_den = train_data.m_den
+		#m_den = train_data.m_den
+		m_den = len(train_normal[0][0])
 		ln_bot[0] = m_den
 	else:
 		# input and target at random
@@ -744,6 +895,7 @@ if __name__ == "__main__":
 	dlrm = DLRM_Net(
 		m_spa,
 		ln_emb,
+		ln_hot_emb,
 		ln_bot,
 		ln_top,
 		arch_interaction_op=args.arch_interaction_op,
@@ -759,7 +911,6 @@ if __name__ == "__main__":
 		qr_threshold=args.qr_threshold,
 		md_flag=args.md_flag,
 		md_threshold=args.md_threshold,
-		gpu_cache=data_mgr.gpu_cache
 	)
 	# test prints
 	if args.debug_mode:
@@ -791,15 +942,27 @@ if __name__ == "__main__":
 			torch.cuda.synchronize()
 		return time.time()
 
-	def dlrm_wrap(X, lS_o, lS_i, use_gpu, device):
-		if use_gpu:  # .cuda()
+	def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, data):
+		if data == "hot":  # .cuda()
+			# lS_i can be either a list of tensors or a stacked tensor.
+			# Handle each case below:
+			lS_i = [S_i.to(device) for S_i in lS_i] if isinstance(lS_i, list) \
+				else lS_i.to(device)
+			lS_o = [S_o.to(device) for S_o in lS_o] if isinstance(lS_o, list) \
+				else lS_o.to(device)
 			return dlrm(
 				X.to(device),
-				lS_o.to(device),
-				lS_i.to(device)
+				lS_o,
+				lS_i,
+				data
 			)
 		else:
-			return dlrm(X, lS_o, lS_i)
+			return dlrm(
+				X.to(device),
+				lS_o,
+				lS_i,
+				data
+			)
 
 	def loss_fn_wrap(Z, T, use_gpu, device):
 		if args.loss_function == "mse" or args.loss_function == "bce":
@@ -910,12 +1073,11 @@ if __name__ == "__main__":
 			if args.mlperf_logging:
 				previous_iteration_time = None
 
-			# last_iteration_time_stamp = time.time()
-			prefetching_wait_step_limit = 1100
-			prefetching_wait_step_count = 0
-			for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-				if j == 0 and args.save_onnx:
-					(X_onnx, lS_o_onnx, lS_i_onnx) = (X, lS_o, lS_i)
+			start_time = time.time()
+
+			# Using Normal Train Data
+			for j, (X, lS_o, lS_i, T) in enumerate(train_normal_ld):
+				data = "normal"
 
 				if j < skip_upto_batch:
 					continue
@@ -931,34 +1093,21 @@ if __name__ == "__main__":
 					t1 = time_wrap(use_gpu)
 
 				# early exit if nbatches was set by the user and has been exceeded
-				if nbatches > 0 and j >= nbatches:
-					data_mgr.exit_flag = True
+				if nbatches_normal > 0 and j >= nbatches_normal:
 					break
-				'''
-				# debug prints
-				print("input and targets")
-				print(X.detach().cpu().numpy())
-				print([np.diff(S_o.detach().cpu().tolist()
-					   + list(lS_i[i].shape)).tolist() for i, S_o in enumerate(lS_o)])
-				print([S_i.detach().cpu().numpy().tolist() for S_i in lS_i])
-				print(T.detach().cpu().numpy())
-				'''
-				should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
+				
+				should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches_normal)
 
 				begin_forward = time_wrap(use_gpu)
 				# forward pass
-				Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+				
+				Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, data)
 
 				end_forward = time_wrap(use_gpu)
 
 				# loss
 				E = loss_fn_wrap(Z, T, use_gpu, device)
-				'''
-				# debug prints
-				print("output and loss")
-				print(Z.detach().cpu().numpy())
-				print(E.detach().cpu().numpy())
-				'''
+				
 				# compute loss and accuracy
 				L = E.detach().cpu().numpy()  # numpy array
 				S = Z.detach().cpu().numpy()  # numpy array
@@ -976,17 +1125,10 @@ if __name__ == "__main__":
 					# for l in mlp.layers:
 					#     if hasattr(l, 'weight'):
 					#          print(l.weight.grad.norm().item())
-
 					end_backward = time_wrap(use_gpu)
 
 					# optimizer
 					optimizer.step()
-
-					# update cache row's batch flags
-					# with torch.no_grad():
-						# dlrm.emb_l[0].cache_weight_mgr.update_batch_flag()
-						# for i in range(len(dlrm.emb_l)):
-						# 	dlrm.emb_l[i].cache_weight_mgr.update_batch_flag(embedding_bag_id=dlrm.emb_l[i].embedding_bag_id)
 
 					end_optimizing = time_wrap(use_gpu)
 
@@ -994,22 +1136,13 @@ if __name__ == "__main__":
 
 					end_scheduling = time_wrap(use_gpu)
 
-					# Unlock the prefetching thread
-					with torch.no_grad():
-						data_mgr.gpu_cache._finished_batch += 1
-						if prefetching_wait_step_count > prefetching_wait_step_limit:
-							prefetching_wait_step_count = 0
-							data_mgr.prefetching_ready.set()
-						else:
-							prefetching_wait_step_count += 1
-						# print("[Training] Finish training on batch " + str(j) + " (" + str(end_scheduling - last_iteration_time_stamp) + "s)")
-						# last_iteration_time_stamp = end_scheduling
-
+				
 				if args.mlperf_logging:
 					total_time += iteration_time
 				else:
 					t2 = time_wrap(use_gpu)
 					total_time += t2 - t1
+
 				total_accu += A
 				total_loss += L * mbs
 				total_iter += 1
@@ -1023,7 +1156,7 @@ if __name__ == "__main__":
 				should_test = (
 					(args.test_freq > 0)
 					and (args.data_generation == "dataset")
-					and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches))
+					and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches_normal))
 				)
 
 				# print time, loss and accuracy
@@ -1057,6 +1190,7 @@ if __name__ == "__main__":
 					print("Iteration_time ", gT)
 					print("Loss ", gL)
 					print("Accuracy ", gA*100)
+					print("Train_data ", data)
 					print("\n")
 
 					# Uncomment the line below to print out the total time with overhead
@@ -1068,6 +1202,7 @@ if __name__ == "__main__":
 					backward_time = 0
 					optimizer_time = 0
 					scheduler_time = 0
+
 
 				# testing
 				if should_test and not args.inference_only:
@@ -1085,6 +1220,7 @@ if __name__ == "__main__":
 						targets = []
 
 					for i, (X_test, lS_o_test, lS_i_test, T_test) in enumerate(test_ld):
+						data = "test"
 						# early exit if nbatches was set by the user and was exceeded
 						if nbatches > 0 and i >= nbatches:
 							break
@@ -1092,9 +1228,8 @@ if __name__ == "__main__":
 						t1_test = time_wrap(use_gpu)
 						should_print = 0
 						# forward pass
-						Z_test = dlrm_wrap(
-							X_test, lS_o_test, lS_i_test, use_gpu, device
-						)
+						Z_test = dlrm_wrap(X_test, lS_o_test, lS_i_test, use_gpu, device, data)
+						
 						if args.mlperf_logging:
 							S_test = Z_test.detach().cpu().numpy()  # numpy array
 							T_test = T_test.detach().cpu().numpy()  # numpy array
@@ -1113,9 +1248,11 @@ if __name__ == "__main__":
 							test_accu += A_test
 							test_loss += L_test * mbs_test
 							test_samp += mbs_test
+							
 
 						t2_test = time_wrap(use_gpu)
 
+					
 					if args.mlperf_logging:
 						scores = np.concatenate(scores, axis=0)
 						targets = np.concatenate(targets, axis=0)
@@ -1203,7 +1340,6 @@ if __name__ == "__main__":
 
 						print("Test_Iteration ", j + 1)
 						print("Total_Iterations ", nbatches)
-						print("Epoch ", k)
 						print("Test_Loss ", validation_results['loss'])
 						print("Test_recall ", validation_results['recall'])
 						print("Test_precision ", validation_results['precision'])
@@ -1245,9 +1381,368 @@ if __name__ == "__main__":
 							  + " reached, stop training")
 						break
 
+			# At the end of train_normal_ld last iteration start training with train_hot_ld data 
+			# ======================= Updating the hot_emb_l with emb_l =====================
+			
+			if stop == 0:
+				begin_emb_update = time_wrap(use_gpu)
+
+				for _, emb_dict in enumerate(hot_emb_dict):
+					for _, (emb_no, emb_row) in enumerate(emb_dict):
+						hot_row = int(emb_dict[(emb_no, emb_row)])
+						data = dlrm.emb_l[emb_no].weight.data[emb_row]
+						dlrm.hot_emb_l[0].weight.data[hot_row] = data
+
+				end_emb_update = time_wrap(use_gpu)
+
+				print("\nEMB_hot_Update ", 1000*(end_emb_update - begin_emb_update))
+				print("\n")
+			
+						
+			# ===============================================================================
+			
+			if stop == 0:
+				# Using Hot Train Data
+				for j, (X, lS_o, lS_i, T) in enumerate(train_hot_ld):
+					data = "hot"
+
+					if j < skip_upto_batch:
+						continue
+
+					if args.mlperf_logging:
+						current_time = time_wrap(use_gpu)
+						if previous_iteration_time:
+							iteration_time = current_time - previous_iteration_time
+						else:
+							iteration_time = 0
+						previous_iteration_time = current_time
+					else:
+						t1 = time_wrap(use_gpu)
+
+					# early exit if nbatches was set by the user and has been exceeded
+					if nbatches_hot > 0 and j >= nbatches_hot:
+						break
+						
+					should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches_hot)
+
+					begin_forward = time_wrap(use_gpu)
+					# forward pass
+				
+					Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, data)
+
+					end_forward = time_wrap(use_gpu)
+
+					# loss
+					E = loss_fn_wrap(Z, T, use_gpu, device)
+		
+					# compute loss and accuracy
+					L = E.detach().cpu().numpy()  # numpy array
+					S = Z.detach().cpu().numpy()  # numpy array
+					T = T.detach().cpu().numpy()  # numpy array
+					mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+					A = np.sum((np.round(S, 0) == T).astype(np.uint8))
+
+					if not args.inference_only:
+						# scaled error gradient propagation
+						# (where we do not accumulate gradients across mini-batches)
+						optimizer.zero_grad()
+						# backward pass
+						E.backward()
+
+						end_backward = time_wrap(use_gpu)
+
+						# optimizer
+						optimizer.step()
+
+						end_optimizing = time_wrap(use_gpu)
+
+						lr_scheduler.step()
+
+						end_scheduling = time_wrap(use_gpu)
+
+					if args.mlperf_logging:
+						total_time += iteration_time
+					else:
+						t2 = time_wrap(use_gpu)
+						total_time += t2 - t1
+
+					total_accu += A
+					total_loss += L * mbs
+					total_iter += 1
+					total_samp += mbs
+					forward_time += end_forward - begin_forward
+					backward_time += end_backward - end_forward
+					optimizer_time += end_optimizing - end_backward
+					scheduler_time += end_scheduling - end_optimizing
+
+					#should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
+					should_test = (
+						(args.test_freq > 0)
+						and (args.data_generation == "dataset")
+						and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches_hot))
+					)
+
+					# print time, loss and accuracy
+					if should_print or should_test:
+						gT = 1000.0 * total_time / total_iter if args.print_time else -1
+						total_time = 0
+
+						gA = total_accu / total_samp
+						total_accu = 0
+
+						gL = total_loss / total_samp
+						total_loss = 0
+
+						gForward = 1000 * forward_time / total_iter
+
+						gBackward = 1000 * backward_time / total_iter
+
+						gOptimizer = 1000 * optimizer_time / total_iter
+
+						gScheduler = 1000 * scheduler_time /total_iter
+
+						str_run_type = "inference" if args.inference_only else "training"
+
+						print("Forward ", gForward)
+						print("Backward ", gBackward)
+						print("Optimizer ", gOptimizer)
+						print("LR_scheduler ", gScheduler)
+						print("Epoch ", k)
+						print("Iteration ", len(train_normal_ld) + j + 1)
+						print("Total_Iterations ", nbatches)
+						print("Iteration_time ", gT)
+						print("Loss ", gL)
+						print("Accuracy ", gA*100)
+						print("Train_data ", data)
+						print("\n")
+
+						total_iter = 0
+						total_samp = 0
+						forward_time = 0
+						backward_time = 0
+						optimizer_time = 0
+						scheduler_time = 0
+
+					# testing
+					if should_test and not args.inference_only:
+						# don't measure training iter time in a test iteration
+
+						# Before testing the emb_l using hot_emb_l
+						# ======================= Updating the emb_l with hot_emb_l =====================
+						
+						begin_emb_update = time_wrap(use_gpu)
+
+						hot_emb = dlrm.hot_emb_l[0].weight.detach().cpu().numpy()
+						
+						for _, emb_dict in enumerate(hot_emb_dict):
+							for _, (emb_no, emb_row) in enumerate(emb_dict):
+								hot_row = emb_dict[(emb_no, emb_row)]
+								data = torch.tensor(hot_emb[hot_row])
+								dlrm.emb_l[emb_no].weight.data[emb_row] = data
+
+						end_emb_update = time_wrap(use_gpu)
+
+						print("\nEMB_normal_Update ", 1000*(end_emb_update - begin_emb_update))
+						print("\n")
+						
+						# ===============================================================================
+				
+						test_accu = 0
+						test_loss = 0
+						test_samp = 0
+
+						accum_test_time_begin = time_wrap(use_gpu)
+						if args.mlperf_logging:
+							scores = []
+							targets = []
+
+						for i, (X_test, lS_o_test, lS_i_test, T_test) in enumerate(test_ld):
+							data = "test"
+							# early exit if nbatches was set by the user and was exceeded
+							if nbatches > 0 and i >= nbatches:
+								break
+
+							t1_test = time_wrap(use_gpu)
+							should_print = 0
+							# forward pass
+							Z_test = dlrm_wrap(X_test, lS_o_test, lS_i_test, use_gpu, device, data)
+						
+							if args.mlperf_logging:
+								S_test = Z_test.detach().cpu().numpy()  # numpy array
+								T_test = T_test.detach().cpu().numpy()  # numpy array
+								scores.append(S_test)
+								targets.append(T_test)
+							else:
+								# loss
+								E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device)
+
+								# compute loss and accuracy
+								L_test = E_test.detach().cpu().numpy()  # numpy array
+								S_test = Z_test.detach().cpu().numpy()  # numpy array
+								T_test = T_test.detach().cpu().numpy()  # numpy array
+								mbs_test = T_test.shape[0]  # = mini_batch_size except last
+								A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+								test_accu += A_test
+								test_loss += L_test * mbs_test
+								test_samp += mbs_test
+
+							t2_test = time_wrap(use_gpu)
+
+					
+						if args.mlperf_logging:
+							scores = np.concatenate(scores, axis=0)
+							targets = np.concatenate(targets, axis=0)
+
+							metrics = {
+								'loss' : sklearn.metrics.log_loss,
+								'recall' : lambda y_true, y_score:
+								sklearn.metrics.recall_score(
+									y_true=y_true,
+									y_pred=np.round(y_score)
+								),
+								'precision' : lambda y_true, y_score:
+								sklearn.metrics.precision_score(
+									y_true=y_true,
+									y_pred=np.round(y_score)
+								),
+								'f1' : lambda y_true, y_score:
+								sklearn.metrics.f1_score(
+									y_true=y_true,
+									y_pred=np.round(y_score)
+								),
+								'ap' : sklearn.metrics.average_precision_score,
+								'roc_auc' : sklearn.metrics.roc_auc_score,
+								'accuracy' : lambda y_true, y_score:
+								sklearn.metrics.accuracy_score(
+									y_true=y_true,
+									y_pred=np.round(y_score)
+								),
+								# 'pre_curve' : sklearn.metrics.precision_recall_curve,
+								# 'roc_curve' :  sklearn.metrics.roc_curve,
+							}
+
+							# print("Compute time for validation metric : ", end="")
+							# first_it = True
+							validation_results = {}
+							for metric_name, metric_function in metrics.items():
+								# if first_it:
+								#     first_it = False
+								# else:
+								#     print(", ", end="")
+								# metric_compute_start = time_wrap(False)
+								validation_results[metric_name] = metric_function(
+									targets,
+									scores
+								)
+								# metric_compute_end = time_wrap(False)
+								# met_time = metric_compute_end - metric_compute_start
+								# print("{} {:.4f}".format(metric_name, 1000 * (met_time)),
+								#      end="")
+							# print(" ms")
+							gA_test = validation_results['accuracy']
+							gL_test = validation_results['loss']
+						else:
+							gA_test = test_accu / test_samp
+							gL_test = test_loss / test_samp
+
+						is_best = gA_test > best_gA_test
+						if is_best:
+							best_gA_test = gA_test
+							if not (args.save_model == ""):
+								print("Saving model to {}".format(args.save_model))
+								torch.save(
+									{
+										"epoch": k,
+										"nepochs": args.nepochs,
+										"nbatches": nbatches,
+										"nbatches_test": nbatches_test,
+										"iter": j + 1,
+										"state_dict": dlrm.state_dict(),
+										"train_acc": gA,
+										"train_loss": gL,
+										"test_acc": gA_test,
+										"test_loss": gL_test,
+										"total_loss": total_loss,
+										"total_accu": total_accu,
+										"opt_state_dict": optimizer.state_dict(),
+									},
+									args.save_model,
+								)
+
+						if args.mlperf_logging:
+							is_best = validation_results['roc_auc'] > best_auc_test
+							if is_best:
+								best_auc_test = validation_results['roc_auc']
+
+							print("Test_Iteration ", len(train_normal_ld) + j + 1)
+							print("Total_Iterations ", nbatches)
+							print("Test_Loss ", validation_results['loss'])
+							print("Test_recall ", validation_results['recall'])
+							print("Test_precision ", validation_results['precision'])
+							print("Test_f1 ", validation_results['f1'])
+							print("Test_ap ", validation_results['ap'])
+							print("Test_auc ", validation_results['roc_auc'])
+							print("Best_auc ", best_auc_test)
+							print("Test_Accuracy ", validation_results['accuracy'] * 100)
+							print("Best_Accuracy ", best_gA_test * 100)
+							print("\n")
+							
+						else:
+							print("Test_Iteration ", len(train_normal_ld) + j + 1)
+							print("Total_Iterations ", nbatches)
+							print("Test_Loss ", gL_test)
+							print("Test_Accuracy ", gA_test * 100)
+							print("Best_test_Accuracy ", best_gA_test * 100)
+							print("\n")
+							
+						# Uncomment the line below to print out the total time with overhead
+						# print("Total test time for this group: {}" \
+						# .format(time_wrap(use_gpu) - accum_test_time_begin))
+
+						if (args.mlperf_logging
+							and (args.mlperf_acc_threshold > 0)
+							and (best_gA_test > args.mlperf_acc_threshold)):
+							print("MLPerf testing accuracy threshold "
+								 + str(args.mlperf_acc_threshold)
+								+ " reached, stop training")
+							stop = 1
+							break
+
+						if (args.mlperf_logging
+							and (args.mlperf_auc_threshold > 0)
+							and (best_auc_test > args.mlperf_auc_threshold)):
+							print("MLPerf testing auc threshold "
+								+ str(args.mlperf_auc_threshold)
+								+ " reached, stop training")
+							break
+
+				# At the end of train_hot_ld last iteration update the emb_l
+				# ======================= Updating the emb_l with hot_emb_l =====================
+						
+				begin_emb_update = time_wrap(use_gpu)
+
+				hot_emb = dlrm.hot_emb_l[0].weight.detach().cpu().numpy()
+							
+				for _, emb_dict in enumerate(hot_emb_dict):
+					for _, (emb_no, emb_row) in enumerate(emb_dict):
+						hot_row = int(emb_dict[(emb_no, emb_row)])
+						data = torch.tensor(hot_emb[hot_row])
+						dlrm.emb_l[emb_no].weight.data[emb_row] = data
+
+				end_emb_update = time_wrap(use_gpu)
+
+				print("\nEMB_normal_Update ", 1000*(end_emb_update - begin_emb_update))
+				print("\n")
+						
+				# ===============================================================================
+
 			k += 1  # nepochs
+
+			end_time = time.time()
+			print("=========================================================\nTotal time: " + str(end_time - start_time) + "\n=========================================================")
+
 		accum_time_end = time_wrap(use_gpu)
-		print("Total_Epoch_Time ", 1000*(accum_time_end - accum_time_begin))
+		print("Total_Execution_Time ", 1000*(accum_time_end - accum_time_begin))
 
 	# profiling
 	if args.enable_profiling:

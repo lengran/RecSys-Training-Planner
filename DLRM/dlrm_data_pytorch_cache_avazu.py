@@ -29,13 +29,13 @@ class PlanedSampler(torch.utils.data.Sampler[List[int]]):
     """
     def __init__(
             self, 
-            ready: bool, 
+            ready: bool,
             data_path: str, 
-            batch_size: Optional[int], 
-            shuffle: Optional[bool], 
-            drop_last: Optional[bool], 
-            dataset: Optional[Sized],
-            suffix: Optional[str]
+            batch_size: Optional[int] = None, 
+            shuffle: Optional[bool] = None, 
+            drop_last: Optional[bool] = None, 
+            dataset: Optional[Sized] = None,
+            suffix: Optional[str] = None
             ) -> None:
         self.data_path = path.abspath(data_path)
         if not path.exists(self.data_path):
@@ -189,8 +189,8 @@ class Data_Manager(object):
             suffix = "-random"
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
-            custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
-            # custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
+            # custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
+            custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
@@ -230,7 +230,7 @@ class Data_Manager(object):
                 # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 self.prefetching_signal.set()
-                self.prefetching_thread = threading.Thread(target=self.NoneLFUCacheRowLoader, args=[args.training_plan_dir, suffix])
+                self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir])
                 self.prefetching_thread.start()
             else:
                 self.training_ready.set() 
@@ -265,7 +265,7 @@ class Data_Manager(object):
         else:
             for i in range(featureCnt):
                 offseted_ids = X_cat[:, i].flatten().add(self.offsets[i])           # A naive way to hash ids in diff cats, TODO: design a better hash function
-                self.gpu_cache.none_lfu_prepare_ids(offseted_ids, self.batch_pointer)
+                self.gpu_cache.prepare_ids(offseted_ids, self.batch_pointer)
             self.batch_pointer = self.batch_pointer + 1
 
         lS_i = [X_cat[:, i] for i in range(featureCnt)]

@@ -529,7 +529,7 @@ def make_avazu_data_and_loaders(args):
 
 def load_avazu_test_data_and_loaders(args):
 
-    test_data = CriteoDataset(
+    test_data = AvazuDataset(
             args.data_set,
             args.max_ind_range,
             args.data_sub_sample_rate,
