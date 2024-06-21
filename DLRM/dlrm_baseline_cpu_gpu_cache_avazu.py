@@ -61,7 +61,7 @@ import functools
 import time
 import json
 # data generation
-import dlrm_data_pytorch as dp
+import dlrm_data_pytorch_cache_avazu as dp
 
 # numpy
 import numpy as np

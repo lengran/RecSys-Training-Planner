@@ -48,6 +48,7 @@ class PlanedSampler(torch.utils.data.Sampler[List[int]]):
 
         if ready:
             # If already have a training plan, just load it.
+            # import pdb; pdb.set_trace()
             self.batches = pandas.read_parquet(path.join(self.data_path, "batches.parquet")).astype(int).values.tolist()
             self.training_plan = pandas.read_parquet(path.join(self.data_path, plan_file_name)).astype(int).squeeze().tolist()
             self.length = len(self.training_plan)
@@ -76,7 +77,7 @@ class PlanedSampler(torch.utils.data.Sampler[List[int]]):
         # Return a batch each time.
         for i in range(self.length):
             batch_idx = self.training_plan[i]
-            if batch_idx != (self.length - 1):
+            if batch_idx != (len(self.batches) - 1):
                 yield self.batches[batch_idx]
             else:
                 # Deal with placebo -1 before acutally returning data indices.
@@ -186,11 +187,12 @@ class Data_Manager(object):
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True , async_copy=True, buffer_size=0)
 
             self.data_path = args.training_plan_dir
-            suffix = "-random"
+            suffix = ""
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
-            # custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
-            custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
+            custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
+            self.debug_sampler = custom_sampler
+            # custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
             self.train_loader = torch.utils.data.DataLoader(
@@ -235,6 +237,10 @@ class Data_Manager(object):
             else:
                 self.training_ready.set() 
 
+        # debug
+        data = pandas.read_parquet(path.join(args.training_plan_dir, "id_to_prefetch.parquet"))
+        self.debug_ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
+
     def collate_cached_wrapper_avazu(self, list_of_tuples):
         '''
         Customized collate function that update cache.
@@ -252,7 +258,7 @@ class Data_Manager(object):
         # Update cache and the batch pointer
         if self.infinite_prefetch:
             if self.loader_count >= self.batch_pointer:
-                # print("[Warning] Training waits! Current status: batch_pointer = " + str(self.batch_pointer) + ", prefetch_wait_step_count = " + str(self.prefetch_wait_step_count) + ", _finished_batch = " + str(self.gpu_cache._finished_batch))
+                print("[Warning] Training waits! Current status: batch_pointer = " + str(self.batch_pointer) + ", prefetch_wait_step_count = " + str(self.prefetch_wait_step_count) + ", _finished_batch = " + str(self.gpu_cache._finished_batch))
                 # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 # start_time = time.time()
@@ -274,90 +280,27 @@ class Data_Manager(object):
         self.sleep_interval = min(self.sleep_interval, _tmp_time_stamp - self._load_time_stamp)
         self._load_time_stamp = _tmp_time_stamp
 
+        '''
+        # DEBUG
+        # ID1 = values from dataset + self.offset
+        tmp_lS_i_T = torch.stack(lS_i).T
+        tmp_final_lS_i_T = tmp_lS_i_T + torch.tensor(self.offsets)
+        tmp_id1 = torch.unique(torch.flatten(tmp_final_lS_i_T.T), sorted=True)
+        # ID2 = prefetched values
+        # tmp_id2 = torch.sort(torch.tensor(self.debug_sampler.batches[self.debug_sampler.training_plan[self.loader_count - 1]])).values
+        tmp_id2 = self.debug_ids_batches[self.loader_count - 1]
+        tmp_id2.sort()
+        tmp_id2 = torch.tensor(tmp_id2, dtype=torch.int64)
+        # ID1 == ID2 should be True
+        test_result = torch.unique(tmp_id1 == tmp_id2)
+        if test_result.size(dim=0) == 1 and test_result.item() == True:
+            print("Check passed on batch " + str(self.loader_count - 1))
+        else:
+            print("Check failed on batch " + str(self.loader_count - 1))
+        '''
+
+
         return X_int, torch.stack(lS_o), torch.stack(lS_i), T
-
-    '''
-    def PlannedCacheRowLoader(self):
-        """
-        A separate thread, prefetching planed embedding entries as far as it can.
-        Issue prefetching request with specified rows operations.
-        NOTE: This function hasn't been tested.
-        """
-        # Lists of list.
-        ids_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "ids.parquet")).astype(int).values.tolist()
-        slots_to_evict_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_evict.parquet")).astype(int).values.tolist()
-        slots_to_move_in_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_move_in.parquet")).astype(int).values.tolist()
-        slots_to_update_batches = pandas.read_parquet(path.join(self.data_path, "slots_to_update.parquet")).astype(int).values.tolist()
-        batch_pointer = 0
-
-        import pdb; pdb.set_trace()
-        while True:
-            print("Prefetching embedding entries for batch " + str(batch_pointer) + ".")
-            ids_to_move_in = ids_to_move_in_batches[batch_pointer]
-            slots_to_evict = slots_to_evict_batches[batch_pointer]
-            slots_to_move_in = slots_to_move_in_batches[batch_pointer]
-            slots_to_update = slots_to_update_batches[batch_pointer]
-
-            # move rows to gpu (a temporary place not directly to cache)
-            # TODO: Why are these code here? Shouldn't them belong to the cache manager?
-            cpu_row_idxs_to_move_in = self.idx_map.index_select(0, ids_to_move_in.to(torch.cuda.current_device()))
-            cpu_row_idxs_to_move_in_copy = cpu_row_idxs_to_move_in.cpu()
-            if self._async_copy:
-                if self.buffer_size == 0:
-                    evict_in_rows_gpu = (
-                        self.weight.view(self.num_embeddings, -1).index_select(0, cpu_row_idxs_to_move_in_copy).pin_memory()
-                    )
-                    with torch.cuda.stream(self._memcpy_stream):
-                        evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
-                else:
-                    raise NotImplemented
-
-
-            succeed = self.gpu_cache.new_prepare_ids(ids_to_move_in, batch_pointer, slots_to_evict, slots_to_move_in, slots_to_update, evict_in_rows_gpu)
-
-            if succeed:
-                batch_pointer += 1
-            else:
-                while not succeed:
-                    time.sleep(self.sleep_interval)
-    
-    def CacheRowLoader(self):
-        """
-        A separate thread, prefetching embedding entries as far as it can.
-        Issue prefetching request.
-        """
-        # Lists of list.
-        ids_batches = pandas.read_parquet(path.join(self.data_path, "ids.parquet")).values.tolist()
-        
-        batch_pointer = 0
-
-        import pdb; pdb.set_trace()
-        while True:
-            print("Prefetching embedding entries for batch " + str(batch_pointer) + ".")
-            ids_batch = ids_batches[batch_pointer]
-
-            # move rows to gpu (a temporary place not directly to cache)
-            cpu_row_idxs_to_move_in = self.idx_map.index_select(0, ids_to_move_in.to(torch.cuda.current_device()))
-            cpu_row_idxs_to_move_in_copy = cpu_row_idxs_to_move_in.cpu()
-            if self._async_copy:
-                if self.buffer_size == 0:
-                    evict_in_rows_gpu = (
-                        self.weight.view(self.num_embeddings, -1).index_select(0, cpu_row_idxs_to_move_in_copy).pin_memory()
-                    )
-                    with torch.cuda.stream(self._memcpy_stream):
-                        evict_in_rows_gpu = evict_in_rows_gpu.to(torch.cuda.current_device(), non_blocking=True)
-                else:
-                    raise NotImplemented
-
-
-            succeed = self.gpu_cache.new_prepare_ids(ids_to_move_in, batch_pointer, slots_to_evict, slots_to_move_in, slots_to_update, evict_in_rows_gpu)
-
-            if succeed:
-                batch_pointer += 1
-            else:
-                while not succeed:
-                    time.sleep(self.sleep_interval)
-    '''
 
     @torch.no_grad()
     def NoneLFUCacheRowLoader(self, plan_path: str, suffix: str = None):
@@ -476,7 +419,7 @@ class Data_Manager(object):
             # waiting_time = 0
             # self.prefetch_wait_step_count = 0
             while not succeed:
-                # print("[Infinite Prefetching] No enough rows. Prefetching waits.")
+                print("[Infinite Prefetching] No enough rows. Prefetching waits.")
                 self.prefetching_ready.clear()
                 self.prefetching_ready.wait()
                 

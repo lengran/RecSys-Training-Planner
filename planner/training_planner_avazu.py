@@ -1,4 +1,4 @@
-import pandas as df
+import cudf as df
 import numpy as np
 from typing import Optional
 import os
@@ -115,6 +115,7 @@ class Planner(object):
         # Count size of features.
         count_data = np.load(os.path.join(os.path.abspath(data_path), "train_fea_count.npz"))
         self.cat_counts = list(count_data["counts"])
+        import pdb; pdb.set_trace()
 
         # Convert id from id_in_cat to unique_id_in_dataset
         rotated_cat_data = np.swapaxes(X_cat, 0, 1)
@@ -153,7 +154,7 @@ class Planner(object):
         print("Loading training plan from " + str(full_path))
         start_time = time.time()
         data = df.read_parquet(full_path)
-        self.plan = data['plan'].to_list()
+        self.plan = data['plan'].to_arrow().to_pylist()
         end_time = time.time()
         print("Training plan loaded. (" + str(end_time - start_time) + "s)")
 
@@ -1242,7 +1243,7 @@ def Training_Plan_to_ID_of_Batches(input_path: str, output_path: str, id_batches
     print("Loading training plan from " + str(input_path))
     start_time = time.time()
     data = df.read_parquet(input_path)
-    training_plan = data['plan'].to_list()
+    training_plan = data['plan'].to_arrow().to_pylist()
     
     # training_plan = [i for i in range(len(id_batches))]
     # # import pdb; pdb.set_trace()
@@ -1264,9 +1265,9 @@ def Training_Plan_to_ID_of_Batches(input_path: str, output_path: str, id_batches
     for i in range(len(training_plan)):
         id_planed_batches.append(df.Series(id_batches[training_plan[i]], dtype='int32'))
         freq_planed_batches.append(df.Series(freq_batches[training_plan[i]], dtype='int32'))
-    output = df.DataFrame({"id_planed_batches": id_planed_batches, "freq_planed_batches": freq_planed_batches})
+    # output = df.DataFrame({"id_planed_batches": id_planed_batches, "freq_planed_batches": freq_planed_batches})
     import pdb; pdb.set_trace()
-    output.to_parquet(output_path)
+    # output.to_parquet(output_path)
 
 def _search_cost(unused_batch: list, batches_id: list, cache_state: np.ndarray, num_available_rows: int, hotness_diff_threshold_startup_cap:int, hotness_diff_threshold: int, search_limit:int, result: Queue):
     '''
@@ -1723,7 +1724,7 @@ def Segmented_LFU_Multiprocess_Search(
     random.shuffle(unused_batch)
 
     # split the remaining unused batches to sub-processes
-    per_process_unused_batch = int(len(unused_batch) / num_process)
+    per_process_unused_batch = int(len(unused_batch) / num_process)                 # This may drop as many as the number of processes batches
     results = list()
     processes = list()
 
