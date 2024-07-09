@@ -11,6 +11,7 @@ python dlrm_baseline_cpu_gpu_cache_avazu.py --arch-sparse-feature-size=16 \
 								--print-freq=4096 \
 								--print-time \
 								--cache-ratio=0.05 \
-								--training-plan-dir=./input/avazu/training_plan/ #\
+								--training-plan-dir=./input/avazu/training_plan/ \
+								--test-freq=10000
 								# --enable-profiling \
 								# --num-batches=100

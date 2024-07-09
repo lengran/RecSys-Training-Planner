@@ -187,11 +187,11 @@ class Data_Manager(object):
             self.gpu_cache = CacheManager(num_embeddings=total_embedding_row, embedding_dim=embedding_dim, cache_ratio=args.cache_ratio, pin_weight=True , async_copy=True, buffer_size=0)
 
             self.data_path = args.training_plan_dir
-            suffix = ""
+            suffix = "-random"
             # First initiate a Sampler that read training plan from a directory, then pass it to DataLoaders
             # TODO: Deal with this gracefully. 1. Use arg.data_randomize. 2. Add another arg to choose whether import training plan or not.
             custom_sampler = PlanedSampler(True, self.data_path, None, None, None, None, suffix)
-            self.debug_sampler = custom_sampler
+            # self.debug_sampler = custom_sampler
             # custom_sampler = PlanedSampler(False, self.data_path, batch_size=args.mini_batch_size, shuffle=False, drop_last=False, dataset=self.train_data)
 
             # Dataloaders
@@ -232,14 +232,14 @@ class Data_Manager(object):
                 # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 self.prefetching_signal.set()
-                self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir])
+                self.prefetching_thread = threading.Thread(target=self.CacheRowLoader, args=[args.training_plan_dir, suffix])
                 self.prefetching_thread.start()
             else:
                 self.training_ready.set() 
 
         # debug
-        data = pandas.read_parquet(path.join(args.training_plan_dir, "id_to_prefetch.parquet"))
-        self.debug_ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
+        # data = pandas.read_parquet(path.join(args.training_plan_dir, "id_to_prefetch" + suffix + ".parquet"))
+        # self.debug_ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
 
     def collate_cached_wrapper_avazu(self, list_of_tuples):
         '''
@@ -258,7 +258,7 @@ class Data_Manager(object):
         # Update cache and the batch pointer
         if self.infinite_prefetch:
             if self.loader_count >= self.batch_pointer:
-                print("[Warning] Training waits! Current status: batch_pointer = " + str(self.batch_pointer) + ", prefetch_wait_step_count = " + str(self.prefetch_wait_step_count) + ", _finished_batch = " + str(self.gpu_cache._finished_batch))
+                # print("[Warning] Training waits! Current status: batch_pointer = " + str(self.batch_pointer) + ", prefetch_wait_step_count = " + str(self.prefetch_wait_step_count) + ", _finished_batch = " + str(self.gpu_cache._finished_batch))
                 # self.prefetch_wait_step_count = self.prefetch_wait_step_limit
                 self.prefetching_ready.set()
                 # start_time = time.time()
@@ -280,24 +280,25 @@ class Data_Manager(object):
         self.sleep_interval = min(self.sleep_interval, _tmp_time_stamp - self._load_time_stamp)
         self._load_time_stamp = _tmp_time_stamp
 
-        '''
-        # DEBUG
-        # ID1 = values from dataset + self.offset
-        tmp_lS_i_T = torch.stack(lS_i).T
-        tmp_final_lS_i_T = tmp_lS_i_T + torch.tensor(self.offsets)
-        tmp_id1 = torch.unique(torch.flatten(tmp_final_lS_i_T.T), sorted=True)
-        # ID2 = prefetched values
-        # tmp_id2 = torch.sort(torch.tensor(self.debug_sampler.batches[self.debug_sampler.training_plan[self.loader_count - 1]])).values
-        tmp_id2 = self.debug_ids_batches[self.loader_count - 1]
-        tmp_id2.sort()
-        tmp_id2 = torch.tensor(tmp_id2, dtype=torch.int64)
-        # ID1 == ID2 should be True
-        test_result = torch.unique(tmp_id1 == tmp_id2)
-        if test_result.size(dim=0) == 1 and test_result.item() == True:
-            print("Check passed on batch " + str(self.loader_count - 1))
-        else:
-            print("Check failed on batch " + str(self.loader_count - 1))
-        '''
+        
+        # # DEBUG
+        # # ID1 = values from dataset + self.offset
+        # tmp_lS_i_T = torch.stack(lS_i).T
+        # tmp_final_lS_i_T = tmp_lS_i_T + torch.tensor(self.offsets)
+        # tmp_id1 = torch.unique(torch.flatten(tmp_final_lS_i_T.T), sorted=True)
+        # # ID2 = prefetched values
+        # # tmp_id2 = torch.sort(torch.tensor(self.debug_sampler.batches[self.debug_sampler.training_plan[self.loader_count - 1]])).values
+        # tmp_id2 = self.debug_ids_batches[self.loader_count - 1]
+        # tmp_id2.sort()
+        # tmp_id2 = torch.tensor(tmp_id2, dtype=torch.int64)
+        # # import pdb; pdb.set_trace()
+        # # ID1 == ID2 should be True
+        # test_result = torch.unique(tmp_id1 == tmp_id2)
+        # if test_result.size(dim=0) == 1 and test_result.item() == True:
+        #     print("Check passed on batch " + str(self.loader_count - 1))
+        # else:
+        #     print("Check failed on batch " + str(self.loader_count - 1))
+        
 
 
         return X_int, torch.stack(lS_o), torch.stack(lS_i), T
@@ -371,19 +372,28 @@ class Data_Manager(object):
             # print("[Infinite Prefetching] Finished prefetching for batch " + str(self.batch_pointer) + " (" + str(end_time - start_time - waiting_time) + "s, waiting time " + str(waiting_time) + ")")
 
     @torch.no_grad()
-    def CacheRowLoader(self, plan_path: str):
+    def CacheRowLoader(self, plan_path: str, suffix: str = None):
         """
         A separate thread, prefetching embedding entries as far as it can.
         Issue prefetching request.
         """
         # Lists of list.
-        data = pandas.read_parquet(path.join(plan_path, "id_to_prefetch.parquet"))
+        if suffix == None:
+            path_file_name = "id_to_prefetch.parquet"
+        else:
+            path_file_name = "id_to_prefetch" + suffix + ".parquet"
+        data = pandas.read_parquet(path.join(plan_path, path_file_name))
         ids_batches = data["id_planed_batches"].tolist()       # type(ids_batches) = list, type(ids_batches) = np.ndarray
         freq_batches = data["freq_planed_batches"].tolist()
         
         self.batch_pointer = 0
 
         for _ in range(len(ids_batches)):
+            if suffix == "-random" and self.batch_pointer > self.loader_count + 5:                              # ScratchPipe
+                self.prefetching_ready.clear()
+                self.training_ready.set()
+                self.prefetching_ready.wait()
+
             # start_time = time.time()
             # First compute which ids need to be transfered.
             self.prefetching_signal.wait()

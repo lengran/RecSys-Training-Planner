@@ -122,7 +122,7 @@ def processAvazuData(npzfile, convertDicts): #(d_path, d_file, npzfile, i, conve
 
     # process data if not all files exist
     filename = npzfile + "_processed.npz"
-    num_cat_feat = 22
+    num_cat_feat = 21
 
     if path.exists(filename):
         print("Using existing " + filename, end="\n")
@@ -914,7 +914,7 @@ def getAvazuData(
     #     if "avazu" == "avazu":
     #         # WARNING: The raw data consists of a single "train" file
     #         # Each line (except the first one) in the file is a sample, consisting 
-    #         # of 1 continuous (but need to be split into 2) and 22 categorical
+    #         # of 1 continuous (but need to be split into 2) and 21 categorical
     #         # features (an extra space indicates that feature is missing and will
     #         # be interpreted as 0).
         if path.exists(datafile):
@@ -947,7 +947,7 @@ def getAvazuData(
 
     # process a file worth of data and reinitialize data
     # note that a file main contain a single or multiple splits
-    num_cat_feat = 22
+    num_cat_feat = 21
     num_con_feat = 2
     
     def process_one_file(
@@ -1009,7 +1009,7 @@ def getAvazuData(
                         id_of_id += 1
 
                     X_cat[i] = np.array(
-                        [converted_id] +
+                        # [converted_id] +
                         list(map(lambda x: int(x, 10), line[3:5])) + 
                         list(map(lambda x: int(x, 16), line[5:14])) +
                         list(map(lambda x: int(x, 10), line[14:])),

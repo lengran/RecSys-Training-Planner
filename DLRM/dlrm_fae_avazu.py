@@ -1155,7 +1155,7 @@ if __name__ == "__main__":
 				#should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
 				should_test = (
 					(args.test_freq > 0)
-					and (args.data_generation == "dataset")
+					and (args.data_generation == "avazu")
 					and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches_normal))
 				)
 
@@ -1478,7 +1478,7 @@ if __name__ == "__main__":
 					#should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
 					should_test = (
 						(args.test_freq > 0)
-						and (args.data_generation == "dataset")
+						and (args.data_generation == "avazu")
 						and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches_hot))
 					)
 
@@ -1536,7 +1536,7 @@ if __name__ == "__main__":
 						
 						for _, emb_dict in enumerate(hot_emb_dict):
 							for _, (emb_no, emb_row) in enumerate(emb_dict):
-								hot_row = emb_dict[(emb_no, emb_row)]
+								hot_row = int(emb_dict[(emb_no, emb_row)])
 								data = torch.tensor(hot_emb[hot_row])
 								dlrm.emb_l[emb_no].weight.data[emb_row] = data
 

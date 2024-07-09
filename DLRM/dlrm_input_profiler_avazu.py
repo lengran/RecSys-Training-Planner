@@ -304,9 +304,10 @@ if __name__ == "__main__":
 	hot_emb_dict = np.array(hot_emb_dict, dtype = object)
 	
 	if args.data_set == "avazu":
-		np.savez_compressed('./input/avazu/avazu_hot_cold/train_hot.npz', train_hot)
-		np.savez_compressed('./input/avazu/avazu_hot_cold/train_normal.npz', train_normal)
-		np.savez_compressed('./input/avazu/avazu_hot_cold/hot_emb_dict.npz', hot_emb_dict)
+		folder_path = os.path.dirname(args.processed_data_file)
+		np.savez_compressed(os.path.join(folder_path, 'avazu_hot_cold/train_hot.npz'), train_hot)
+		np.savez_compressed(os.path.join(folder_path, 'avazu_hot_cold/train_normal.npz'), train_normal)
+		np.savez_compressed(os.path.join(folder_path, 'avazu_hot_cold/hot_emb_dict.npz'), hot_emb_dict)
 				
 	print("Save Hot/Cold Data Completed")
 	sys.exit("FAE pre-processing completed!!")
